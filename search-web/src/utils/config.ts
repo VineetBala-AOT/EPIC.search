@@ -1,3 +1,5 @@
+import { WebStorageStateStore } from "oidc-client-ts";
+
 declare global {
   interface Window {
     _env_: {
@@ -30,10 +32,11 @@ export const AppConfig = {
 
 export const OidcConfig = {
   authority: OIDC_AUTHORITY,
+  kc_idp_hint: "idir",
   client_id: CLIENT_ID,
   redirect_uri: `${APP_URL}/oidc-callback`,
   post_logout_redirect_uri: `${APP_URL}/`,
   scope: "openid profile email",
   revokeTokensOnSignout: true,
-  extraQueryParams: { kc_idp_hint: "idir" },
+  userStore: new WebStorageStateStore({ store: window.sessionStorage }),
 };
