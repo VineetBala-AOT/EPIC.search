@@ -35,7 +35,7 @@ export default function EAOAppBar() {
                   paddingLeft={"0.5rem"}
                   fontWeight={"bold"}
                 >
-                  {AppConfig.appTitle || "EPIC.condition"}
+                  {AppConfig.appTitle || "EPIC.centre"}
                 </Typography>
               </>
             )}
