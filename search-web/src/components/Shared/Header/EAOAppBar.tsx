@@ -1,15 +1,12 @@
-import { AppBar, Grid, Typography, Box, Divider } from "@mui/material";
+import { AppBar, Divider, Grid, Typography } from "@mui/material";
 import EAO_Logo from "@/assets/images/EAO_Logo.png";
 import { AppConfig } from "@/utils/config";
-import { BCDesignTokens } from "epic.theme";
-import useAuth from "@/hooks/useAuth";
-import { useIsMobile } from "@/hooks/common";
 import AppBarActions from "./AppBarActions";
+import { useIsMobile } from "@/hooks/common";
+import { BCDesignTokens } from "epic.theme";
 
 export default function EAOAppBar() {
   const isMobile = useIsMobile();
-  const { login } = useAuth();
-
   return (
     <>
       <AppBar
@@ -26,15 +23,7 @@ export default function EAOAppBar() {
           paddingX={isMobile ? 0 : "0.5rem"}
           justifyContent="space-between"
         >
-          <Box
-            display="flex"
-            justifyContent="start"
-            alignItems="center"
-            onClick={login}
-            sx={{
-              cursor: "pointer",
-            }}
-          >
+          <Grid item display="flex" justifyContent="start" alignItems="center">
             <img src={EAO_Logo} height={isMobile ? 40 : 56} />
             {!isMobile && (
               <>
@@ -50,9 +39,9 @@ export default function EAOAppBar() {
                 </Typography>
               </>
             )}
-          </Box>
-
+          </Grid>
           <Grid
+            item
             display="flex"
             justifyContent="center"
             alignItems="center"

@@ -1,6 +1,10 @@
-import NoRoles from "@/components/Shared/NoRoles";
-import { createFileRoute } from "@tanstack/react-router";
+import Unauthorized from "@/components/Unauthorized";
+import { createFileRoute } from '@tanstack/react-router'
 
-export const Route = createFileRoute("/unauthorized")({
-  component: NoRoles,
-});
+export const Route = createFileRoute('/unauthorized')({
+  component: Unauthorize
+})
+
+function Unauthorize() {
+  return <Unauthorized />;
+}

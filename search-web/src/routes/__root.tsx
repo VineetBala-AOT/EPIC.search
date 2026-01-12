@@ -1,17 +1,11 @@
 import EAOAppBar from "@/components/Shared/Header/EAOAppBar";
 import PageNotFound from "@/components/Shared/PageNotFound";
-import AuthMonitor from "@/components/Auth/AuthMonitor";
-// import SideNavBar from "@/components/Shared/SideNavBar";
 import { Box } from "@mui/system";
-import {
-  CatchBoundary,
-  createRootRouteWithContext,
-  Outlet,
-  useNavigate
-} from "@tanstack/react-router";
-// import { TanStackRouterDevtools } from "@tanstack/router-devtools";
+import { createRootRouteWithContext, Outlet } from "@tanstack/react-router";
+import { TanStackRouterDevtools } from "@tanstack/router-devtools";
 import { AuthContextProps } from "react-oidc-context";
-// import { BCDesignTokens } from "epic.theme";
+import { ReactQueryDevtools } from "@tanstack/react-query-devtools";
+
 type RouterContext = {
   authentication: AuthContextProps;
 };
@@ -22,19 +16,14 @@ export const Route = createRootRouteWithContext<RouterContext>()({
 });
 
 function Layout() {
-  const navigate = useNavigate();
-
   return (
-    <CatchBoundary
-      getResetKey={() => "reset"}
-      onCatch={() => navigate({ to: "/error" })}
-    >
-      <AuthMonitor />
+    <>
       <EAOAppBar />
-      <Box>
+      <Box minHeight={"calc(100vh - 88px)"}>
         <Outlet />
       </Box>
-      {/* <TanStackRouterDevtools /> */}
-    </CatchBoundary>
+      <TanStackRouterDevtools position="bottom-left" />
+      <ReactQueryDevtools initialIsOpen={false} />
+    </>
   );
 }

@@ -12,8 +12,8 @@ import {
   ListItemIcon,
   ListItemText
 } from "@mui/material";
-import { createFileRoute, Navigate } from "@tanstack/react-router";
-import { FilterSidebar } from '../components/App/Filters/FilterSideBar';
+import { createFileRoute, Navigate, useSearch } from "@tanstack/react-router";
+import { FilterSidebar } from '../../components/App/Filters/FilterSideBar';
 import { BCDesignTokens } from "epic.theme";
 import { useRoles } from "@/contexts/AuthContext";
 import { getStoredSearchStrategy, setStoredSearchStrategy, RankingConfig, getStoredRankingConfig, scoreSettings, resultsSettings, getStoredSearchMode, setStoredSearchMode } from "@/utils/searchConfig";
@@ -34,27 +34,12 @@ import { PageLoader } from "@/components/PageLoader";
 const SIDEBAR_WIDTH = 280;
 const COLLAPSED_WIDTH = 56;
 
-export const Route = createFileRoute("/search")({
+export const Route = createFileRoute("/_authenticated/search")({
   component: Search,
-  beforeLoad: ({ context }) => {
-    const { isAuthenticated, isLoading, signinRedirect } = context.authentication;
-    
-    // Wait for auth to load before making decision
-    if (isLoading) {
-      return {};
-    }
-    
-    if (!isAuthenticated) {
-      console.log('User not authenticated, redirecting to login');
-      signinRedirect();
-      return {};
-    }
-    
-    return {};
-  },
 });
 
 function Search() {
+  localStorage.removeItem("authReturnPath");
   const { data: rawProjects, isLoading: loadingProjects, isError: projectError } = useProjects();
   const {
     data: rawDocTypes,
@@ -88,6 +73,28 @@ function Search() {
   const [configModalOpen, setConfigModalOpen] = useState(false);
 
   const { isAdmin, isViewer } = useRoles();
+
+  const onSubmitSearchWithQuery = (query: string) => {
+    const searchRequest: SearchRequest = {
+      query,
+      searchStrategy: isViewer ? "HYBRID_PARALLEL" : searchStrategy,
+      ...(selectedProjects.length > 0 && { projectIds: selectedProjects }),
+      ...(selectedDocTypes.length > 0 && { documentTypeIds: selectedDocTypes }),
+      ...(rankingConfig.useCustomRanking && {
+        ranking: {
+          minScore: scoreSettings[isViewer ? "FLEXIBLE" : rankingConfig.scoreSetting],
+          topN: resultsSettings[isViewer ? "MEDIUM" : rankingConfig.resultsSetting],
+        },
+      }),
+      mode: isViewer ? "agent" : searchMode,
+    };
+    doSearch(searchRequest);
+
+    // Update the URL with query parameter
+    const url = new URL(window.location.href);
+    url.searchParams.set("keywords", query);
+    window.history.replaceState(null, "", url.toString());
+  };
 
   const handleProjectToggle = (id: string) => {
     setSelectedProjects((prev) =>
@@ -231,32 +238,28 @@ function Search() {
 
   const onSubmitSearch = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    
-    // Prevent double search: don't start new search if one is already in progress
-    if (isPending) {
-      console.log('Search already in progress, ignoring new search request');
-      return;
-    }
-    
-    const searchRequest: SearchRequest = {
-      query: searchText,
-      searchStrategy: isViewer ? 'HYBRID_PARALLEL' : searchStrategy,
-      ...(selectedProjects.length > 0 && { projectIds: selectedProjects }),
-      ...(selectedDocTypes.length > 0 && { documentTypeIds: selectedDocTypes }),
-      ...(rankingConfig.useCustomRanking && {
-        ranking: {
-          minScore: scoreSettings[
-            isViewer ? "FLEXIBLE" : rankingConfig.scoreSetting
-          ],
-          topN: resultsSettings[
-            isViewer ? "MEDIUM" : rankingConfig.resultsSetting
-          ],
-        }
-      }),
-      mode: isViewer ? 'agent' : searchMode,
-    };
-    doSearch(searchRequest);
+    if (!searchText.trim()) return;
+    onSubmitSearchWithQuery(searchText.trim());
   };
+
+  const searchParams = useSearch({ from: "/_authenticated/search" });
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+
+    // Support both possible param names
+    const initialQuery = params.get("keywords")?.trim();
+
+    if (initialQuery) {
+      setSearchText(initialQuery);
+
+      // ensure URL stores it consistently as ?q=
+      const url = new URL(window.location.href);
+      url.searchParams.set("q", initialQuery);
+      window.history.replaceState(null, "", url.toString());
+
+      onSubmitSearchWithQuery(initialQuery);
+    }
+  }, [searchParams]);
 
   useEffect(() => {
     if (!searchText) {
@@ -515,6 +518,7 @@ function Search() {
                   onClick={() => {
                     reset();
                     setSearchResults(null);
+                    setSearchText("");
                   }}
                 >
                   <Cancel sx={{ fontSize: 30, color: '#d32f2f' }} />

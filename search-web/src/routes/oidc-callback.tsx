@@ -1,24 +1,32 @@
-import { createFileRoute, Navigate, useLocation } from "@tanstack/react-router";
+import { createFileRoute, Navigate } from "@tanstack/react-router";
 import { useAuth } from "react-oidc-context";
 import { PageLoader } from "@/components/PageLoader";
 import { useRoles } from "@/contexts/AuthContext";
+import { useEffect, useState } from "react";
 
 export const Route = createFileRoute("/oidc-callback")({
   component: OidcCallback,
 });
 
 function OidcCallback() {
-  const { isAuthenticated, isLoading, error } = useAuth();
-  const location = useLocation();
+  const { error: getAuthError, user: kcUser, isLoading } = useAuth();
   const { hasAnyRole } = useRoles();
+  const [navTarget, setNavTarget] = useState<string | null>(null);
 
-  if (isLoading) return <PageLoader />;
-  if (error) return <Navigate to="/error" />;
+  useEffect(() => {
+    if (kcUser && hasAnyRole !== undefined) {
+      const saved = localStorage.getItem("authReturnPath") ?? "/search";
+      setNavTarget(saved);
+    }
+  }, [kcUser, hasAnyRole]);
 
-  if (isAuthenticated) {
-    const redirectTo = (location as any).state?.redirectTo || (hasAnyRole ? "/search" : "/");
-    return <Navigate to={redirectTo} replace />;
+  if (getAuthError) {
+    return <Navigate to="/error" />;
   }
 
-  return <Navigate to="/" replace />;
+  if (isLoading || navTarget === null) {
+    return <PageLoader />;
+  }
+
+  return <Navigate to={navTarget} />;
 }

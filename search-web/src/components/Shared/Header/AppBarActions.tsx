@@ -13,10 +13,11 @@ import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import { useState } from "react";
 import { OidcConfig } from "@/utils/config";
 import { BCDesignTokens } from "epic.theme";
+import { useNavigate } from "@tanstack/react-router";
 
 export default function AppBarActions() {
   const auth = useAuth();
-
+  const navigate = useNavigate();
   const [anchorEl, setAnchorEl] = useState<null | HTMLElement>(null);
   const open = Boolean(anchorEl);
   const handleClick = (event: React.MouseEvent<HTMLElement>) => {
@@ -26,19 +27,16 @@ export default function AppBarActions() {
     setAnchorEl(null);
   };
 
-  const handleLogin = () => {
+  const handleNavigate = (path: string) => {
     setAnchorEl(null);
-    auth.signinRedirect({
-      redirect_uri: `${OidcConfig.redirect_uri}${window.location.search}`,
-      prompt: "login",
-    });
+    navigate({ to: path });
   };
 
   return (
     <>
       {auth.isAuthenticated ? (
         <>
-          <Box id="menu-appbar" display="flex" alignItems="center">
+          <Box id="menu-appbar" display={"flex"} onClick={handleClick}>
             <Typography
               variant="body2"
               color="primary"
@@ -47,31 +45,36 @@ export default function AppBarActions() {
             >
               Hi, {auth.user?.profile.given_name}
             </Typography>
-            <IconButton size="small" onClick={handleClick}>
+            <IconButton size="small" sx={{ m: 0, p: 0 }}>
               <KeyboardArrowDownIcon
                 fontSize="small"
                 htmlColor={theme.palette.grey[900]}
               />
             </IconButton>
-            <AccountCircleIcon
-              fontSize="large"
-              htmlColor={theme.palette.grey[900]}
-              sx={{ ml: 0.5 }}
-            />
           </Box>
+          <AccountCircleIcon
+            fontSize="large"
+            htmlColor={theme.palette.grey[900]}
+            sx={{ marginLeft: "0.25rem" }}
+          />
           <Menu
+            id="menu-appbar"
+            aria-labelledby="menu-appbar"
             open={open}
             anchorEl={anchorEl}
             onClose={handleClose}
-            anchorOrigin={{ vertical: "top", horizontal: "right" }}
-            transformOrigin={{ vertical: "top", horizontal: "right" }}
+            anchorOrigin={{
+              vertical: "top",
+              horizontal: "right",
+            }}
+            transformOrigin={{
+              vertical: "top",
+              horizontal: "right",
+            }}
           >
             <MenuItem
               onClick={() => {
-                handleClose();
-                auth.signoutRedirect({
-                  post_logout_redirect_uri: window.location.origin,
-                });
+                handleNavigate("/logout");
               }}
             >
               Sign Out
@@ -81,11 +84,17 @@ export default function AppBarActions() {
       ) : (
         <Button
           variant="text"
-          onClick={handleLogin}
+          onClick={() =>
+            auth.signinRedirect({
+              redirect_uri: `${OidcConfig.redirect_uri}${window.location.search}`,
+              extraQueryParams: {
+                kc_idp_hint: OidcConfig.kc_idp_hint,
+              },
+            })
+          }
           sx={{
             color: BCDesignTokens.themeGray100,
             border: `2px solid ${theme.palette.grey[700]}`,
-            visibility: open ? "hidden" : "visible",
           }}
         >
           Login
