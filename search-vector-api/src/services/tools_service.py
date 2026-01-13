@@ -369,7 +369,7 @@ class ToolsService:
                             "steps": [...]
                         }
                     },
-                    "default_strategy": "HYBRID_SEMANTIC_FALLBACK",
+                    "default_strategy": "HYBRID_PARALLEL",
                     "total_strategies": 6
                 }
         """
@@ -480,7 +480,7 @@ class ToolsService:
             
             response = {
                 "search_strategies": strategies_array,
-                "default_strategy": "HYBRID_SEMANTIC_FALLBACK",
+                "default_strategy": "HYBRID_PARALLEL",
                 "total_strategies": len(strategies_array)
             }
             

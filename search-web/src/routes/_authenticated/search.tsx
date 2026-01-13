@@ -10,7 +10,8 @@ import {
   Menu,
   MenuItem,
   ListItemIcon,
-  ListItemText
+  ListItemText,
+  Stack
 } from "@mui/material";
 import { createFileRoute, Navigate, useSearch } from "@tanstack/react-router";
 import { FilterSidebar } from '../../components/App/Filters/FilterSideBar';
@@ -31,7 +32,7 @@ import { useDocumentTypeMappings } from "@/hooks/useDocumentTypeMappings";
 import { useProjects } from "@/hooks/useProjects";
 import { PageLoader } from "@/components/PageLoader";
 
-const SIDEBAR_WIDTH = 280;
+const SIDEBAR_WIDTH = 320;
 const COLLAPSED_WIDTH = 56;
 
 export const Route = createFileRoute("/_authenticated/search")({
@@ -50,7 +51,7 @@ function Search() {
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try {
       const raw = localStorage.getItem("collapsed");
-      return raw ? JSON.parse(raw) : true; // default collapsed
+      return raw ? JSON.parse(raw) : false; // default open
     } catch {
       return false;
     }
@@ -185,7 +186,7 @@ function Search() {
     if (isViewer) return "HYBRID_PARALLEL";
 
     // Admin: use stored value or undefined
-    return stored;
+    return stored ?? "HYBRID_PARALLEL";
   });
 
   const onSuccess = (data: SearchResponse) => {
@@ -280,13 +281,14 @@ function Search() {
         minHeight: "100vh",
         width: "100%",
         paddingTop: "60px",
+        maxWidth: "1448px",
       }}
     >
       {/* Sidebar */}
       <Box
         sx={{
-          width: collapsed ? COLLAPSED_WIDTH : SIDEBAR_WIDTH,
-          minWidth: collapsed ? COLLAPSED_WIDTH : SIDEBAR_WIDTH,
+          width: collapsed ? `${COLLAPSED_WIDTH}px` : `${SIDEBAR_WIDTH}px`,
+          minWidth: collapsed ? `${COLLAPSED_WIDTH}px` : `${SIDEBAR_WIDTH}px`,
           backgroundColor: `${BCDesignTokens.themeBlue10}`,
           display: "flex",
           flexDirection: "column",
@@ -330,202 +332,227 @@ function Search() {
           >
             Search for documents by entering a keyword or phrase below.
           </Typography>
-          <Paper
-            component="form"
-            sx={{
-              borderRadius: "8px",
-              display: "flex",
-              alignItems: "center",
-              padding: "8px 16px",
-              border: "1px solid",
-              borderColor: BCDesignTokens.themeBlue10,
-              boxShadow: "0px 2px 6px -2px rgb(0 0 0 / 33%)",
-              "&:hover": {
-                boxShadow: "0px 2px 18px 0px rgb(85 149 217 / 36%)",
-              },
-              "&:focus-within": {
-                boxShadow: "0px 2px 18px 0px rgb(85 149 217 / 36%)",
-              },
-            }}
-          >
-            {isAdmin &&
-              <Tooltip title={`${getModeLabel(searchMode)}: ${getModeDescription(searchMode)}`}>
-                <IconButton
-                  onClick={handleModeMenuOpen}
-                  sx={{
-                    mr: 1,
-                    borderRadius: "12px",
-                    minWidth: "48px",
-                    height: "48px",
-                    color: BCDesignTokens.iconsColorSuccess,
-                    "&:hover": {
-                      backgroundColor: BCDesignTokens.supportSurfaceColorSuccess,
-                    },
-                  }}
-                >
-                  {getModeIcon(searchMode)}
-                </IconButton>
-              </Tooltip>
-            }
-            
-            <Menu
-              anchorEl={modeMenuAnchor}
-              open={Boolean(modeMenuAnchor)}
-              onClose={handleModeMenuClose}
-              anchorOrigin={{
-                vertical: 'bottom',
-                horizontal: 'left',
-              }}
-              transformOrigin={{
-                vertical: 'top',
-                horizontal: 'left',
-              }}
-              PaperProps={{
-                sx: {
-                  borderRadius: '12px',
-                  boxShadow: '0px 4px 20px rgba(0, 0, 0, 0.1)',
-                }
+          <Stack spacing={1.5}>
+            <Paper
+              component="form"
+              sx={{
+                borderRadius: "8px",
+                display: "flex",
+                alignItems: "center",
+                padding: "8px 16px",
+                border: "1px solid",
+                borderColor: BCDesignTokens.themeBlue10,
+                boxShadow: "0px 2px 6px -2px rgb(0 0 0 / 33%)",
+                "&:hover": {
+                  boxShadow: "0px 2px 18px 0px rgb(85 149 217 / 36%)",
+                },
+                "&:focus-within": {
+                  boxShadow: "0px 2px 18px 0px rgb(85 149 217 / 36%)",
+                },
               }}
             >
-              <MenuItem 
-                onClick={() => handleModeChange('rag')}
-                selected={searchMode === 'rag'}
-                sx={{
-                  px: 2,
-                  py: 1.5,
-                  backgroundColor: searchMode === 'rag' ? BCDesignTokens.themeBlue10 : 'transparent',
-                  '&:hover': {
-                    backgroundColor: BCDesignTokens.themeBlue10,
-                  }
-                }}
-              >
-                <ListItemIcon sx={{ minWidth: '36px' }}>
-                  <FindInPage sx={{ fontSize: 20, color: BCDesignTokens.themePrimaryBlue }} />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="RAG Search"
-                  secondary="Pure vector search, fastest"
-                  secondaryTypographyProps={{
-                    sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
-                  }}
-                />
-              </MenuItem>
+              {isAdmin &&
+                <Tooltip title={`${getModeLabel(searchMode)}: ${getModeDescription(searchMode)}`}>
+                  <IconButton
+                    onClick={handleModeMenuOpen}
+                    sx={{
+                      mr: 1,
+                      borderRadius: "12px",
+                      minWidth: "48px",
+                      height: "48px",
+                      color: BCDesignTokens.iconsColorSuccess,
+                      "&:hover": {
+                        backgroundColor: BCDesignTokens.supportSurfaceColorSuccess,
+                      },
+                    }}
+                  >
+                    {getModeIcon(searchMode)}
+                  </IconButton>
+                </Tooltip>
+              }
               
-              <MenuItem 
-                onClick={() => handleModeChange('summary')}
-                selected={searchMode === 'summary'}
-                sx={{
-                  px: 2,
-                  py: 1.5,
-                  backgroundColor: searchMode === 'summary' ? BCDesignTokens.themeBlue10 : 'transparent',
-                  '&:hover': {
-                    backgroundColor: BCDesignTokens.themeBlue10,
+              <Menu
+                anchorEl={modeMenuAnchor}
+                open={Boolean(modeMenuAnchor)}
+                onClose={handleModeMenuClose}
+                anchorOrigin={{
+                  vertical: 'bottom',
+                  horizontal: 'left',
+                }}
+                transformOrigin={{
+                  vertical: 'top',
+                  horizontal: 'left',
+                }}
+                PaperProps={{
+                  sx: {
+                    borderRadius: '12px',
+                    boxShadow: '0px 4px 20px rgba(0, 0, 0, 0.1)',
                   }
                 }}
               >
-                <ListItemIcon sx={{ minWidth: '36px' }}>
-                  <Summarize sx={{ fontSize: 20, color: BCDesignTokens.themePrimaryBlue }} />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Summary Search"
-                  secondary="Use RAG search and summarize"
-                  secondaryTypographyProps={{
-                    sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
-                  }}
-                />
-              </MenuItem>
-              
-              <MenuItem 
-                onClick={() => handleModeChange('ai')}
-                selected={searchMode === 'ai'}
-                sx={{
-                  px: 2,
-                  py: 1.5,
-                  backgroundColor: searchMode === 'ai' ? BCDesignTokens.themeBlue10 : 'transparent',
-                  '&:hover': {
-                    backgroundColor: BCDesignTokens.themeBlue10,
-                  }
-                }}
-              >
-                <ListItemIcon sx={{ minWidth: '36px' }}>
-                  <Psychology sx={{ fontSize: 20, color: BCDesignTokens.themePrimaryBlue }} />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="AI Search"
-                  secondary="Use NLP to interpret your query and summarize"
-                  secondaryTypographyProps={{
-                    sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
-                  }}
-                />
-              </MenuItem>
-              
-              <MenuItem 
-                onClick={() => handleModeChange('agent')}
-                selected={searchMode === 'agent'}
-                sx={{
-                  px: 2,
-                  py: 1.5,
-                  backgroundColor: searchMode === 'agent' ? BCDesignTokens.themeBlue10 : 'transparent',
-                  '&:hover': {
-                    backgroundColor: BCDesignTokens.themeBlue10,
-                  }
-                }}
-              >
-                <ListItemIcon sx={{ minWidth: '36px' }}>
-                  <AutoAwesomeTwoTone sx={{ fontSize: 20, color: BCDesignTokens.themeBlue100 }} />
-                </ListItemIcon>
-                <ListItemText 
-                  primary="Agent Search"
-                  secondary="Full AI processing with agent capabilities"
-                  secondaryTypographyProps={{
-                    sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
-                  }}
-                />
-              </MenuItem>
-            </Menu>
-            <InputBase
-              sx={{ ml: 1, flex: 1, height: 64 }}
-              value={searchText}
-              onChange={(e) => setSearchText(e.target.value)}
-              placeholder={searchMode !== 'rag' ? "Ask AI about documents..." : "Search documents..."}
-              inputProps={{ "aria-label": "search text" }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  onSubmitSearch(e);
-                }
-              }}
-            />
-            {isAdmin &&
-              <Tooltip title="Search Configuration">
-                <IconButton
-                  type="button"
-                  sx={{ p: "10px" }}
-                  aria-label="search configuration"
-                  size="large"
-                  onClick={() => setConfigModalOpen(true)}
-                >
-                  <Settings sx={{ fontSize: 24, color: BCDesignTokens.themeGray60 }} />
-                </IconButton>
-              </Tooltip>
-            }
-            {isPending ? (
-              <Tooltip title="Cancel search">
-                <IconButton
-                  type="button"
-                  sx={{ p: "10px" }}
-                  aria-label="cancel search"
-                  size="large"
-                  onClick={() => {
-                    reset();
-                    setSearchResults(null);
-                    setSearchText("");
+                <MenuItem 
+                  onClick={() => handleModeChange('rag')}
+                  selected={searchMode === 'rag'}
+                  sx={{
+                    px: 2,
+                    py: 1.5,
+                    backgroundColor: searchMode === 'rag' ? BCDesignTokens.themeBlue10 : 'transparent',
+                    '&:hover': {
+                      backgroundColor: BCDesignTokens.themeBlue10,
+                    }
                   }}
                 >
-                  <Cancel sx={{ fontSize: 30, color: '#d32f2f' }} />
-                </IconButton>
-              </Tooltip>
-            ) : searchText ? (
-              <>
+                  <ListItemIcon sx={{ minWidth: '36px' }}>
+                    <FindInPage sx={{ fontSize: 20, color: BCDesignTokens.themePrimaryBlue }} />
+                  </ListItemIcon>
+                  <ListItemText 
+                    primary="RAG Search"
+                    secondary="Pure vector search, fastest"
+                    secondaryTypographyProps={{
+                      sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
+                    }}
+                  />
+                </MenuItem>
+                
+                <MenuItem 
+                  onClick={() => handleModeChange('summary')}
+                  selected={searchMode === 'summary'}
+                  sx={{
+                    px: 2,
+                    py: 1.5,
+                    backgroundColor: searchMode === 'summary' ? BCDesignTokens.themeBlue10 : 'transparent',
+                    '&:hover': {
+                      backgroundColor: BCDesignTokens.themeBlue10,
+                    }
+                  }}
+                >
+                  <ListItemIcon sx={{ minWidth: '36px' }}>
+                    <Summarize sx={{ fontSize: 20, color: BCDesignTokens.themePrimaryBlue }} />
+                  </ListItemIcon>
+                  <ListItemText 
+                    primary="Summary Search"
+                    secondary="Use RAG search and summarize"
+                    secondaryTypographyProps={{
+                      sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
+                    }}
+                  />
+                </MenuItem>
+                
+                <MenuItem 
+                  onClick={() => handleModeChange('ai')}
+                  selected={searchMode === 'ai'}
+                  sx={{
+                    px: 2,
+                    py: 1.5,
+                    backgroundColor: searchMode === 'ai' ? BCDesignTokens.themeBlue10 : 'transparent',
+                    '&:hover': {
+                      backgroundColor: BCDesignTokens.themeBlue10,
+                    }
+                  }}
+                >
+                  <ListItemIcon sx={{ minWidth: '36px' }}>
+                    <Psychology sx={{ fontSize: 20, color: BCDesignTokens.themePrimaryBlue }} />
+                  </ListItemIcon>
+                  <ListItemText 
+                    primary="AI Search"
+                    secondary="Use NLP to interpret your query and summarize"
+                    secondaryTypographyProps={{
+                      sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
+                    }}
+                  />
+                </MenuItem>
+                
+                <MenuItem 
+                  onClick={() => handleModeChange('agent')}
+                  selected={searchMode === 'agent'}
+                  sx={{
+                    px: 2,
+                    py: 1.5,
+                    backgroundColor: searchMode === 'agent' ? BCDesignTokens.themeBlue10 : 'transparent',
+                    '&:hover': {
+                      backgroundColor: BCDesignTokens.themeBlue10,
+                    }
+                  }}
+                >
+                  <ListItemIcon sx={{ minWidth: '36px' }}>
+                    <AutoAwesomeTwoTone sx={{ fontSize: 20, color: BCDesignTokens.themeBlue100 }} />
+                  </ListItemIcon>
+                  <ListItemText 
+                    primary="Agent Search"
+                    secondary="Full AI processing with agent capabilities"
+                    secondaryTypographyProps={{
+                      sx: { fontSize: '0.75rem', color: BCDesignTokens.themeGray60 }
+                    }}
+                  />
+                </MenuItem>
+              </Menu>
+              <InputBase
+                sx={{ ml: 1, flex: 1, height: 64 }}
+                value={searchText}
+                onChange={(e) => setSearchText(e.target.value)}
+                placeholder={searchMode !== 'rag' ? "Ask AI about documents..." : "Search documents..."}
+                inputProps={{ "aria-label": "search text" }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    onSubmitSearch(e);
+                  }
+                }}
+              />
+              {isAdmin &&
+                <Tooltip title="Search Configuration">
+                  <IconButton
+                    type="button"
+                    sx={{ p: "10px" }}
+                    aria-label="search configuration"
+                    size="large"
+                    onClick={() => setConfigModalOpen(true)}
+                  >
+                    <Settings sx={{ fontSize: 24, color: BCDesignTokens.themeGray60 }} />
+                  </IconButton>
+                </Tooltip>
+              }
+              {isPending ? (
+                <Tooltip title="Cancel search">
+                  <IconButton
+                    type="button"
+                    sx={{ p: "10px" }}
+                    aria-label="cancel search"
+                    size="large"
+                    onClick={() => {
+                      reset();
+                      setSearchResults(null);
+                      setSearchText("");
+                    }}
+                  >
+                    <Cancel sx={{ fontSize: 30, color: '#d32f2f' }} />
+                  </IconButton>
+                </Tooltip>
+              ) : searchText ? (
+                <>
+                  <Tooltip title="Search">
+                    <IconButton
+                      type="button"
+                      sx={{ p: "10px" }}
+                      aria-label="search"
+                      size="large"
+                      onClick={onSubmitSearch}
+                    >
+                      <SearchIcon sx={{ fontSize: 30 }} />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Clear search">
+                    <IconButton
+                      type="button"
+                      sx={{ p: "10px" }}
+                      aria-label="clear search"
+                      size="large"
+                      onClick={() => setSearchText("")}
+                    >
+                      <Cancel sx={{ fontSize: 30 }} />
+                    </IconButton>
+                  </Tooltip>
+                </>
+              ) : (
                 <Tooltip title="Search">
                   <IconButton
                     type="button"
@@ -537,46 +564,24 @@ function Search() {
                     <SearchIcon sx={{ fontSize: 30 }} />
                   </IconButton>
                 </Tooltip>
-                <Tooltip title="Clear search">
-                  <IconButton
-                    type="button"
-                    sx={{ p: "10px" }}
-                    aria-label="clear search"
-                    size="large"
-                    onClick={() => setSearchText("")}
-                  >
-                    <Cancel sx={{ fontSize: 30 }} />
-                  </IconButton>
-                </Tooltip>
-              </>
-            ) : (
-              <Tooltip title="Search">
-                <IconButton
-                  type="button"
-                  sx={{ p: "10px" }}
-                  aria-label="search"
-                  size="large"
-                  onClick={onSubmitSearch}
-                >
-                  <SearchIcon sx={{ fontSize: 30 }} />
-                </IconButton>
-              </Tooltip>
-            )}
-          </Paper>
-          <Grid
-            container
-            spacing={2}
-            alignItems="stretch"
-            sx={{ mt: 2, mb: 1 }}
-          >
-            <Grid item xs={12} md={6}>
-              <FeedbackControl sessionId={feedbackSessionId ?? undefined}/>
-            </Grid>
+              )}
+            </Paper>
+            <Grid
+              container
+              alignItems="center"
+              justifyContent="space-between"
+              wrap="nowrap"
+              sx={{ gap: 1 }}
+            >
+              <Grid item sx={{ flex: 1, minWidth: 0 }}>
+                <FeedbackControl sessionId={feedbackSessionId ?? undefined} />
+              </Grid>
 
-            <Grid item xs={12} md={6}>
-              <LocationControl />
+              <Grid item sx={{ flexShrink: 0, minWidth: 0 }}>
+                <LocationControl />
+              </Grid>
             </Grid>
-          </Grid>
+          </Stack>
           {isAdmin &&
             <SearchConfigModal
               open={configModalOpen}

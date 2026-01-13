@@ -37,12 +37,13 @@ const LocationControl: React.FC = () => {
         sx={{
           display: "flex",
           alignItems: "center",
-          gap: 1.5,
-          px: 2,
-          py: 1.25,
+          gap: 1,
+          px: 1,
+          py: 0.5,
           borderRadius: "8px",
           cursor: "pointer",
           minHeight: "45px",
+          maxWidth: '400px',
           backgroundColor: isLocationEnabled ? "#F1F8FE" : "#F3F4F6",
           transition: "background-color 0.2s ease",
           "&:hover": {

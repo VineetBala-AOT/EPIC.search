@@ -52,8 +52,8 @@ const fetchSearchStrategies = async (): Promise<SearchStrategyOption[]> => {
     const strategies: SearchStrategyOption[] = [
       {
         value: undefined,
-        label: "Default",
-        description: `Use the default search strategy (${data.default_strategy || 'HYBRID_SEMANTIC_FALLBACK'})`,
+        label: "Hybrid Parallel",
+        description: `Use the default search strategy (${data.default_strategy || 'HYBRID_PARALLEL'})`,
         enabled: true
       }
     ];

@@ -40,7 +40,9 @@ const SearchConfigModal = ({
   currentStrategy, 
   onSave 
 }: SearchConfigModalProps) => {
-  const [selectedStrategy, setSelectedStrategy] = useState<SearchStrategy | undefined>(currentStrategy);
+  const [selectedStrategy, setSelectedStrategy] = useState<SearchStrategy | undefined>(
+    currentStrategy ?? "HYBRID_PARALLEL"
+  );
   const [rankingConfig, setRankingConfig] = useState<RankingConfig>(getStoredRankingConfig());
   const [showHelp, setShowHelp] = useState<string | null>(null);
   

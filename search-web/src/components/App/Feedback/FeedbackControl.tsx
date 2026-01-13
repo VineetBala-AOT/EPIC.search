@@ -22,13 +22,14 @@ const FeedbackControl: React.FC<FeedbackControlProps> = ({ sessionId }) => {
         sx={{
           display: 'flex',
           alignItems: 'center',
-          gap: 1.5,
-          px: 2,
-          py: 1.5,
-          borderRadius: '8px',
+          gap: 1,
+          px: 1,
+          py: 1,
+          borderRadius: '6px',
           backgroundColor: '#FEF8E8',
           flex: 1,
-          minHeight: '42px',
+          minHeight: '36px',
+          maxWidth: '400px',
         }}
       >
         {/* Feedback Text */}
