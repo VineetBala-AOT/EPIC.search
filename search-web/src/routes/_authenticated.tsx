@@ -9,15 +9,10 @@ export const Route = createFileRoute("/_authenticated")({
 });
 
 function Auth() {
-  const {
-    isAuthenticated,
-    signinRedirect,
-    isLoading: isUserAuthLoading,
-  } = useAuth();
+  const { isAuthenticated, signinRedirect, isLoading: isUserAuthLoading } = useAuth();
+  const { hasAnyRole, isLoading: isRolesLoading } = useRoles();
 
-    const { hasAnyRole } = useRoles();
-
-  const isLoading = isUserAuthLoading;
+  const isLoading = isUserAuthLoading || isRolesLoading;
 
   useEffect(() => {
     if (!isAuthenticated && !isUserAuthLoading) {
@@ -32,12 +27,12 @@ function Auth() {
   }
 
   if (!isAuthenticated) {
-    return <Navigate to={"/"} />;
+    return <Navigate to="/" />;
   }
 
   if (!hasAnyRole) {
     return <Navigate to="/unauthorized" />;
   }
-  
+
   return <Outlet />;
 }

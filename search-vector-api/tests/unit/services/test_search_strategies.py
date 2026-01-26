@@ -55,7 +55,7 @@ class TestSearchStrategies(unittest.TestCase):
         """Test that unknown strategies fall back to the default strategy."""
         strategy = get_search_strategy("UNKNOWN_STRATEGY")
         self.assertIsNotNone(strategy)
-        self.assertEqual(strategy.strategy_name, "HYBRID_SEMANTIC_FALLBACK")
+        self.assertEqual(strategy.strategy_name, "HYBRID_PARALLEL")
     
     def test_strategy_validation(self):
         """Test that strategies properly validate their parameters."""

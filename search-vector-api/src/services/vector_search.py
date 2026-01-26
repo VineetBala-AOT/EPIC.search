@@ -317,7 +317,7 @@ def search(question, project_ids=None, document_type_ids=None, min_relevance_sco
         
         # Try to get the default strategy and execute it
         try:
-            default_strategy = get_search_strategy("HYBRID_SEMANTIC_FALLBACK")
+            default_strategy = get_search_strategy("HYBRID_PARALLEL")
             return default_strategy.execute(
                 question=question,
                 vec_store=vec_store,

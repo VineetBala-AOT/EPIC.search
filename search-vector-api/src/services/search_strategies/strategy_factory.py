@@ -18,7 +18,7 @@ class SearchStrategyFactory:
     
     # Class-level registry of available strategies
     _strategies: Dict[str, Type[BaseSearchStrategy]] = {}
-    _default_strategy: str = "HYBRID_SEMANTIC_FALLBACK"
+    _default_strategy: str = "HYBRID_PARALLEL"
     
     @classmethod
     def register_strategy(cls, name: str, strategy_class: Type[BaseSearchStrategy]) -> None:

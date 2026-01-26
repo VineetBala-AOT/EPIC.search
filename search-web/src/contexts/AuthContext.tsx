@@ -7,6 +7,7 @@ export interface RoleContext {
   isAdmin: boolean;
   isViewer: boolean;
   hasAnyRole: boolean;
+  isLoading: boolean;
 }
 
 const AuthRolesContext = createContext<RoleContext>({
@@ -14,6 +15,7 @@ const AuthRolesContext = createContext<RoleContext>({
   isAdmin: false,
   isViewer: false,
   hasAnyRole: false,
+  isLoading: true,
 });
 
 export function AuthRolesProvider({ children }: { children: ReactNode }) {
@@ -30,12 +32,13 @@ export function AuthRolesProvider({ children }: { children: ReactNode }) {
     }
   }, [auth.isAuthenticated, auth.user]);
 
+  const isLoading = roles === null;
   const isAdmin = roles?.includes("admin") ?? false;
   const isViewer = roles?.includes("viewer") ?? false;
   const hasAnyRole = (roles?.length ?? 0) > 0;
 
   return (
-    <AuthRolesContext.Provider value={{ roles, isAdmin, isViewer, hasAnyRole }}>
+    <AuthRolesContext.Provider value={{ roles, isAdmin, isViewer, hasAnyRole, isLoading }}>
       {children}
     </AuthRolesContext.Provider>
   );
