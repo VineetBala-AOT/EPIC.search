@@ -56,25 +56,67 @@ class AgentHandler(BaseSearchHandler):
         current_app.logger.info("🤖 AGENT MODE: Starting complete agent processing...")
         
         try:
-            # Call agent stub with all user-provided parameters
-            from search_api.services.search_handlers.agent.agent_stub import handle_agent_query
+            import os
             from search_api.services.generation.factories import LLMClientFactory
-            
+
             # Create LLM client for agent planning
             llm_client = LLMClientFactory.create_client()
-            
-            agent_result = handle_agent_query(
-                query=query,
-                reason="Agent mode requested",
-                llm_client=llm_client,
-                user_location=user_location,
-                project_ids=project_ids,
-                document_type_ids=document_type_ids,
-                search_strategy=search_strategy,
-                ranking=ranking,                
-                project_status=project_status,
-                years=years
-            )
+
+            # Check if enhanced agent is enabled via environment variable
+            use_enhanced_agent = os.getenv("USE_ENHANCED_AGENT", "false").lower() == "true"
+
+            if use_enhanced_agent:
+                current_app.logger.info("🚀 AGENT MODE: Using ENHANCED agent with planning, evaluation, and refinement")
+
+                # Import enhanced agent components
+                from search_api.services.search_handlers.agent.enhanced_agent_wrapper import create_enhanced_agent
+                from search_api.services.search_handlers.agent.agent_stub import VectorSearchAgent
+
+                # Create base agent
+                base_agent = VectorSearchAgent(
+                    llm_client=llm_client,
+                    user_location=user_location,
+                    project_ids=project_ids,
+                    document_type_ids=document_type_ids,
+                    search_strategy=search_strategy,
+                    ranking=ranking,
+                    project_status=project_status,
+                    years=years
+                )
+
+                # Wrap with enhanced capabilities
+                enhanced_agent = create_enhanced_agent(base_agent, llm_client)
+
+                # Execute with enhancements
+                agent_result = enhanced_agent.execute_with_enhancements(
+                    query=query,
+                    reason="Agent mode requested",
+                    context={
+                        'discovered_project_ids': [],
+                        'discovered_document_type_ids': [],
+                        'project_name_to_id_mapping': {},
+                        'document_type_name_to_id_mapping': {},
+                        'search_results': []
+                    }
+                )
+            else:
+                current_app.logger.info("🤖 AGENT MODE: Using STANDARD agent")
+
+                # Use existing agent
+                from search_api.services.search_handlers.agent.agent_stub import handle_agent_query
+
+                agent_result = handle_agent_query(
+                    query=query,
+                    reason="Agent mode requested",
+                    llm_client=llm_client,
+                    user_location=user_location,
+                    project_ids=project_ids,
+                    document_type_ids=document_type_ids,
+                    search_strategy=search_strategy,
+                    ranking=ranking,
+                    project_status=project_status,
+                    years=years
+                )
             
             current_app.logger.info("🤖 AGENT MODE: Agent processing completed successfully")
             

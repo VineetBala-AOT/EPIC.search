@@ -63,15 +63,15 @@ class AIHandler(BaseSearchHandler):
             metrics["query_relevance"] = relevance_result
             
             current_app.logger.info(f"🔍 AI MODE: Relevance check completed in {relevance_time}ms: {relevance_result}")
-            
+
             # Handle non-EAO queries
             if not relevance_result.get("is_relevant", True):
                 current_app.logger.info("🔍 AI MODE: Query not relevant to EAO - returning early")
                 metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
-                
+
                 return {
                     "result": {
-                        "response": relevance_result.get("response", "This query appears to be outside the scope of EAO's mandate."),
+                        "response": relevance_result.get("suggested_response", "This query appears to be outside the scope of EAO's mandate."),
                         "documents": [],
                         "document_chunks": [],
                         "metrics": metrics,
@@ -82,7 +82,41 @@ class AIHandler(BaseSearchHandler):
                         "exit_reason": "query_not_relevant"
                     }
                 }
-                
+
+            # Handle generic informational queries (e.g., "What is EAO?")
+            query_type = relevance_result.get("query_type", "specific_search")
+            if query_type == "generic_informational" and relevance_result.get("generic_response"):
+                current_app.logger.info("🔍 AI MODE: Generic informational query detected - returning AI-generated response")
+                metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+                metrics["query_type"] = "generic_informational"
+
+                return {
+                    "result": {
+                        "response": relevance_result.get("generic_response"),
+                        "documents": [],
+                        "document_chunks": [],
+                        "metrics": metrics,
+                        "search_quality": "informational_response",
+                        "project_inference": {},
+                        "document_type_inference": {},
+                        "early_exit": True,
+                        "exit_reason": "generic_informational_query",
+                        "query_type": "generic_informational"
+                    }
+                }
+
+            # Handle broad category search queries (e.g., "Mining projects in BC")
+            if query_type == "broad_category_search":
+                current_app.logger.info("🔍 AI MODE: Broad category search detected - fetching project list")
+                category_filter = relevance_result.get("category_filter")
+
+                return cls._handle_broad_category_search(
+                    query=query,
+                    category_filter=category_filter,
+                    metrics=metrics,
+                    start_time=start_time
+                )
+
         except Exception as e:
             current_app.logger.error(f"🔍 AI MODE: Relevance check failed: {e}")
             metrics["relevance_check_time_ms"] = round((time.time() - relevance_start) * 1000, 2)
@@ -325,3 +359,191 @@ class AIHandler(BaseSearchHandler):
                 "document_type_inference": search_result["document_type_inference"]
             }
         }
+
+    @classmethod
+    def _handle_broad_category_search(cls, query: str, category_filter: Optional[str],
+                                       metrics: Dict, start_time: float) -> Dict[str, Any]:
+        """Handle broad category search queries like 'Mining projects in BC'.
+
+        This method:
+        1. Fetches the list of projects from the vector search API
+        2. Filters projects by category based on metadata
+        3. Generates an AI summary of the matching projects
+        4. Adds a follow-up prompt asking user to narrow down their search
+
+        Args:
+            query: The user's query
+            category_filter: The category to filter by (mining, lng, pipeline, etc.)
+            metrics: Metrics dictionary to update
+            start_time: Start time for timing calculations
+
+        Returns:
+            Complete response dictionary with project list and follow-up prompt
+        """
+        from search_api.clients.vector_search_client import VectorSearchClient
+
+        current_app.logger.info(f"🔍 AI MODE: Handling broad category search for category: {category_filter}")
+
+        try:
+            # Fetch all projects with metadata
+            fetch_start = time.time()
+            all_projects = VectorSearchClient.get_projects_list(include_metadata=True)
+            fetch_time = round((time.time() - fetch_start) * 1000, 2)
+            metrics["project_fetch_time_ms"] = fetch_time
+
+            current_app.logger.info(f"🔍 AI MODE: Fetched {len(all_projects)} total projects in {fetch_time}ms")
+
+            # Filter projects by category if specified
+            filtered_projects = cls._filter_projects_by_category(all_projects, category_filter)
+
+            current_app.logger.info(f"🔍 AI MODE: {len(filtered_projects)} projects match category '{category_filter}'")
+
+            # Generate AI summary of the filtered projects with follow-up prompt
+            summary_response = cls._generate_category_summary(
+                query=query,
+                projects=filtered_projects,
+                category_filter=category_filter
+            )
+
+            metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+            metrics["query_type"] = "broad_category_search"
+            metrics["category_filter"] = category_filter
+            metrics["projects_found"] = len(filtered_projects)
+
+            return {
+                "result": {
+                    "response": summary_response,
+                    "documents": [],
+                    "document_chunks": [],
+                    "metrics": metrics,
+                    "search_quality": "category_list",
+                    "project_inference": {},
+                    "document_type_inference": {},
+                    "early_exit": True,
+                    "exit_reason": "broad_category_search",
+                    "query_type": "broad_category_search",
+                    "category_filter": category_filter,
+                    "projects_in_category": [
+                        {"project_id": p.get("project_id"), "project_name": p.get("project_name")}
+                        for p in filtered_projects[:20]  # Limit to top 20 for response
+                    ]
+                }
+            }
+
+        except Exception as e:
+            current_app.logger.error(f"🔍 AI MODE: Error handling broad category search: {e}")
+            metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+            metrics["category_search_error"] = str(e)
+
+            return {
+                "result": {
+                    "response": f"I found an error while searching for {category_filter or 'projects'} in BC. Please try again or search for a specific project name.",
+                    "documents": [],
+                    "document_chunks": [],
+                    "metrics": metrics,
+                    "search_quality": "error",
+                    "project_inference": {},
+                    "document_type_inference": {},
+                    "early_exit": True,
+                    "exit_reason": "category_search_error"
+                }
+            }
+
+    @classmethod
+    def _filter_projects_by_category(cls, projects: List[Dict], category_filter: Optional[str]) -> List[Dict]:
+        """Filter projects by category based on project name and metadata.
+
+        Args:
+            projects: List of project dictionaries with metadata
+            category_filter: Category to filter by
+
+        Returns:
+            Filtered list of projects matching the category
+        """
+        if not category_filter:
+            return projects
+
+        # Category keywords mapping
+        category_keywords = {
+            "mining": ["mine", "mining", "gold", "copper", "silver", "coal", "mineral", "quarry", "aggregate", "metal"],
+            "lng": ["lng", "liquefied natural gas", "natural gas", "gas export"],
+            "pipeline": ["pipeline", "transmission line", "gas line"],
+            "energy": ["power", "energy", "hydro", "hydroelectric", "wind", "solar", "electricity", "transmission", "substation"],
+            "infrastructure": ["infrastructure", "highway", "bridge", "tunnel"],
+            "water": ["dam", "reservoir", "dyke", "water diversion", "flood control", "water management"],
+            "industrial": ["refinery", "chemical", "industrial", "plant", "facility", "processing"],
+            "transportation": ["port", "terminal", "railway", "railroad", "marine", "airport", "ferry"],
+            "waste": ["landfill", "waste", "hazardous", "disposal"],
+            "resort": ["resort", "ski", "tourism", "recreation", "hotel"]
+        }
+
+        keywords = category_keywords.get(category_filter, [])
+        if not keywords:
+            return projects
+
+        filtered = []
+        for project in projects:
+            project_name = project.get("project_name", "").lower()
+            project_type = project.get("project_metadata", {}).get("type", "").lower() if project.get("project_metadata") else ""
+            project_description = project.get("project_metadata", {}).get("description", "").lower() if project.get("project_metadata") else ""
+
+            # Check if any keyword matches project name, type, or description
+            combined_text = f"{project_name} {project_type} {project_description}"
+            if any(keyword in combined_text for keyword in keywords):
+                filtered.append(project)
+
+        return filtered
+
+    @classmethod
+    def _generate_category_summary(cls, query: str, projects: List[Dict], category_filter: Optional[str]) -> str:
+        """Generate an AI summary of projects in a category with follow-up prompt.
+
+        Args:
+            query: The user's original query
+            projects: List of filtered projects
+            category_filter: The category that was searched
+
+        Returns:
+            Formatted response string with project list and follow-up prompt
+        """
+        category_display = category_filter.upper() if category_filter else "matching"
+
+        if not projects:
+            return f"""I couldn't find any {category_filter or ''} projects in the Environmental Assessment Office database.
+
+You can try:
+- Searching for a specific project name
+- Using a different category (mining, LNG, pipeline, energy, infrastructure, etc.)
+- Asking about a specific document type (certificates, reports, letters)"""
+
+        # Build the project list (limit to prevent overly long responses)
+        max_display = 15
+        project_names = [p.get("project_name", "Unknown") for p in projects[:max_display]]
+
+        # Format project list with bullets
+        project_list = "\n".join([f"• {name}" for name in project_names])
+
+        # Add ellipsis if there are more
+        more_text = ""
+        if len(projects) > max_display:
+            more_text = f"\n• ... and {len(projects) - max_display} more projects"
+
+        # Generate the response with follow-up prompt
+        response = f"""I found **{len(projects)} {category_filter or ''} projects** in the Environmental Assessment Office database:
+
+{project_list}{more_text}
+
+---
+
+**Would you like more details?**
+
+To get specific information, please tell me:
+1. **Which project** interests you? (e.g., "Tell me about Cariboo Gold Project")
+2. **What type of document** are you looking for? (e.g., certificates, letters, reports, Schedule B conditions)
+
+For example, you could ask:
+- "What are the Schedule B conditions for [project name]?"
+- "Show me the certificates for [project name]"
+- "What letters are there about [project name]?"""
+
+        return response

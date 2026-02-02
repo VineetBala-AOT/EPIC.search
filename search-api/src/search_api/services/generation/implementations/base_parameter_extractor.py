@@ -491,62 +491,73 @@ You are given a user query and a list of projects. Each project has the followin
 - description
 
 Task:
-Return a ranked list of projects most relevant to the query, using all metadata. Consider:
+Return a ranked list of projects that match the query. You MUST follow these strict matching rules:
 
-1. Exact and partial matches in project_name, type, sector, and description.
-2. Synonyms, related terms, and alternate phrases:
-   - 'marine port facilities' → 'port', 'terminal', 'jetty', 'wharf', 'dock'
-   - 'hydroelectric' → 'run-of-river', 'power plant', 'generating station'
-   - 'energy storage' → 'LNG', 'gas storage', 'tank', 'facility'
-   - 'tourist destination' → 'resort', 'hotel', 'marina', 'golf', 'recreation'
-   - Include any other relevant synonyms implied by context.
-3. Region relevance: prioritize exact region matches but include nearby or functionally relevant regions.
-4. Proponent relevance: prioritize projects if the proponent or company is mentioned in the query.
-5. Status relevance: prioritize operational, post-decision, or under-construction projects, but include others if highly relevant.
-6. Multiple metadata fields aligning with the query increases confidence.
+### CRITICAL MATCHING RULES (in priority order):
+
+1. **EXACT PROJECT NAME MATCH IS HIGHEST PRIORITY**:
+   - If the query mentions a specific project name (e.g., "Cariboo Gold", "Blackwater Gold", "KSM"),
+     ONLY return projects whose name contains that EXACT phrase.
+   - "Cariboo Gold" should ONLY match projects with "Cariboo Gold" in the name, NOT "Blackwater Gold".
+   - "Blackwater Gold" should ONLY match "Blackwater Gold", NOT "Cariboo Gold".
+   - Do NOT match projects just because they share a common word like "Gold", "Mine", "River", etc.
+
+2. **DISAMBIGUATION RULE**:
+   - When multiple projects share similar words (e.g., "X Gold" vs "Y Gold"), the FULL distinctive
+     portion of the name must match.
+   - "Cariboo" is distinctive. "Gold" is generic. Match on "Cariboo", not on "Gold".
+   - Always prefer projects where MORE words from the query match the project name.
+
+3. **PARTIAL/SEMANTIC MATCHING (only if no exact name match)**:
+   - If no specific project name is mentioned, then use synonyms and related terms:
+     - 'marine port facilities' → 'port', 'terminal', 'jetty', 'wharf', 'dock'
+     - 'hydroelectric' → 'run-of-river', 'power plant', 'generating station'
+     - 'energy storage' → 'LNG', 'gas storage', 'tank', 'facility'
+   - Consider region, proponent, type, sector, and description for broader queries.
+
+4. **CONFIDENCE SCORING**:
+   - 0.95-1.0: Exact project name match (e.g., query mentions "Cariboo Gold" and project is "Cariboo Gold")
+   - 0.80-0.94: Strong match on multiple distinctive terms
+   - 0.60-0.79: Partial match with some relevant metadata
+   - Below 0.60: Weak match, only generic terms match - DO NOT INCLUDE
 
 For each project, return:
 - project_id
 - project_name
-- proponent
-- location
-- region
-- type
-- sector
-- status
-- description
 - confidence (0-1)
 - reason (explain why this project is relevant)
 
-Examples:
+### EXAMPLES:
 
-Query: “certificate for marine port facilities near Lower Mainland”
+Query: "get me the schedule b for Cariboo Gold"
+Correct Response:
+- Cariboo Gold Project | Confidence: 0.98 | Reason: Exact project name match "Cariboo Gold".
+WRONG Response (DO NOT DO THIS):
+- Blackwater Gold Project | Confidence: 0.85 | Reason: Contains "Gold" <- THIS IS WRONG!
+
+Query: "documents for Blackwater Gold mine"
+Correct Response:
+- Blackwater Gold Project | Confidence: 0.98 | Reason: Exact project name match "Blackwater Gold".
+WRONG Response (DO NOT DO THIS):
+- Cariboo Gold Project | Confidence: 0.80 | Reason: Contains "Gold" <- THIS IS WRONG!
+
+Query: "certificate for marine port facilities near Lower Mainland"
 Projects:
-- Tilbury Marine Jetty | Confidence: 0.95 | Reason: Marine port facility in Lower Mainland, directly matches query.
-- Roberts Bank Terminal 2 | Confidence: 0.90 | Reason: Major port facility in Lower Mainland, relevant to query.
-- Vancouver Convention Centre Expansion | Confidence: 0.75 | Reason: Waterfront infrastructure in Lower Mainland, partially relevant to port facilities.
+- Tilbury Marine Jetty | Confidence: 0.95 | Reason: Marine port facility in Lower Mainland.
+- Roberts Bank Terminal 2 | Confidence: 0.90 | Reason: Major port facility in Lower Mainland.
 
-Query: “hydroelectric projects by BC Hydro”
+Query: "hydroelectric projects by BC Hydro"
 Projects:
 - Stave Falls Powerplant | Confidence: 0.95 | Reason: Hydro plant operated by BC Hydro.
-- Waneta Generating Station Upgrade | Confidence: 0.85 | Reason: Co-proponent BC Hydro, hydroelectric generation.
+- Waneta Generating Station Upgrade | Confidence: 0.85 | Reason: Co-proponent BC Hydro.
 
-Query: “LNG storage facilities by FortisBC”
-Projects:
-- Tilbury Phase 2 LNG Expansion | Confidence: 0.95 | Reason: LNG storage facility in Delta, proponent FortisBC, directly relevant to query.
-- WCC LNG | Confidence: 0.85 | Reason: LNG project in Skeena region, relevant to LNG query.
-
-Instructions:
-- Include multiple relevant projects even if only partially matching.
-- Rank results by confidence descending.
-- Use all metadata fields (project_name, type, sector, description, region, location, proponent, status) to maximize relevance.
-- If the query mentions a region or company explicitly, prioritize those matches.
-- Include reasoning for each project to justify relevance.
-
-Available Projects: 
+Available Projects:
 {chr(10).join(project_lines)}
 
 Query: "{query}"
+
+IMPORTANT: Return ONLY projects with confidence >= 0.70. If the query mentions a specific project name,
+that project MUST have the highest confidence. Do NOT return projects that only match on generic words.
 """
 
             logger.info("=== PROJECT EXTRACTION PROMPT (METADATA-AWARE) ===")
@@ -1000,47 +1011,116 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
             logger.info("=== SEMANTIC QUERY EXTRACTION END ===")
             return query
    
-    def _fallback_project_extraction(self, query: str, available_projects: Dict) -> List[str]:
-        """Enhanced fallback project extraction with focus on distinctive name components."""
+    def _fallback_project_extraction(self, query: str, available_projects: Union[Dict, List]) -> List[str]:
+        """Enhanced fallback project extraction with strict name matching and similarity scoring.
+
+        Uses a scoring system that prioritizes:
+        1. Exact project name matches (highest score)
+        2. Distinctive word matches (project-specific identifiers)
+        3. Penalizes matches on generic terms only
+        """
         query_lower = query.lower()
-        matched_projects = []
-       
-        # Common geographic/facility descriptors that are less distinctive
-        generic_terms = {'mountain', 'river', 'creek', 'lake', 'park', 'resort', 'wind', 'reservoir', 'project'}
-       
-        for project_name, project_id in available_projects.items():
-            project_name_lower = project_name.lower()
-           
-            # Check for exact match first
-            if project_name_lower in query_lower or query_lower in project_name_lower:
-                matched_projects.append(project_id)
+        scored_projects = []
+
+        # Common generic terms that should not drive matching
+        generic_terms = {
+            'mountain', 'river', 'creek', 'lake', 'park', 'resort', 'wind', 'reservoir',
+            'project', 'mine', 'gold', 'copper', 'silver', 'coal', 'gas', 'oil', 'lng',
+            'power', 'energy', 'terminal', 'port', 'pipeline', 'transmission', 'line',
+            'facility', 'plant', 'station', 'expansion', 'upgrade', 'phase', 'development'
+        }
+        stop_words = {'the', 'and', 'or', 'of', 'in', 'at', 'to', 'for', 'with', 'by', 'a', 'an', 'get', 'me', 'show', 'find'}
+
+        # Convert available_projects to consistent format
+        projects_iter = []
+        if isinstance(available_projects, dict):
+            projects_iter = [(name, pid) for name, pid in available_projects.items()]
+        elif isinstance(available_projects, list):
+            for proj in available_projects:
+                if isinstance(proj, dict):
+                    projects_iter.append((proj.get('project_name', ''), proj.get('project_id', '')))
+
+        for project_name, project_id in projects_iter:
+            if not project_name or not project_id:
                 continue
-           
-            # Smart keyword matching - focus on distinctive parts
-            project_words = set(project_name_lower.split())
-            query_words = set(query_lower.split())
-           
-            # Filter out common words and generic geographic terms
-            distinctive_project_words = project_words - {'the', 'and', 'or', 'of', 'in', 'at', 'to', 'for', 'with', 'by'} - generic_terms
-            distinctive_query_words = query_words - {'the', 'and', 'or', 'of', 'in', 'at', 'to', 'for', 'with', 'by', 'projects'} - generic_terms
-           
-            # Find matching distinctive words
-            distinctive_matches = distinctive_project_words & distinctive_query_words
-           
-            # Also check for generic terms if there are other supporting matches
-            generic_matches = (project_words & generic_terms) & (query_words & generic_terms)
-           
-            if len(distinctive_matches) > 0:
-                # Strong match - has distinctive identifiers
-                matched_projects.append(project_id)
-            elif len(distinctive_matches) == 0 and len(generic_matches) > 0:
-                # Only generic matches - be very selective
-                # Only include if the query is very specific and short (likely targeting this type)
-                if len(query_words) <= 3 and any(word in project_name_lower for word in query_words if len(word) > 4):
-                    matched_projects.append(project_id)
-       
-        # Limit to 3 for focused results
-        return matched_projects[:3]
+
+            project_name_lower = project_name.lower()
+            score = 0.0
+            match_reason = []
+
+            # Priority 1: Exact full project name in query (highest score)
+            if project_name_lower in query_lower:
+                score = 1.0
+                match_reason.append("exact_name_match")
+            # Priority 2: Query contained in project name
+            elif query_lower in project_name_lower and len(query_lower) > 5:
+                score = 0.9
+                match_reason.append("query_in_name")
+            else:
+                # Priority 3: Word-by-word matching with scoring
+                project_words = set(project_name_lower.split())
+                query_words = set(query_lower.split())
+
+                # Remove stop words from both
+                project_words_clean = project_words - stop_words
+                query_words_clean = query_words - stop_words
+
+                # Separate distinctive vs generic words
+                distinctive_project_words = project_words_clean - generic_terms
+                distinctive_query_words = query_words_clean - generic_terms
+
+                generic_project_words = project_words_clean & generic_terms
+                generic_query_words = query_words_clean & generic_terms
+
+                # Calculate matches
+                distinctive_matches = distinctive_project_words & distinctive_query_words
+                generic_matches = generic_project_words & generic_query_words
+
+                # Score based on distinctive matches (these are the key identifiers)
+                if distinctive_matches:
+                    # Calculate what percentage of distinctive project words matched
+                    if distinctive_project_words:
+                        distinctive_coverage = len(distinctive_matches) / len(distinctive_project_words)
+                        score = 0.5 + (distinctive_coverage * 0.4)  # Range: 0.5 - 0.9
+                        match_reason.append(f"distinctive_match:{distinctive_matches}")
+
+                    # Bonus if generic terms also match (confirms context)
+                    if generic_matches:
+                        score += 0.05
+                        match_reason.append(f"generic_support:{generic_matches}")
+                elif generic_matches:
+                    # ONLY generic matches - this is weak and often wrong
+                    # Only score if it's a very short query targeting a type
+                    if len(query_words_clean) <= 2:
+                        score = 0.2  # Very low score
+                        match_reason.append(f"generic_only:{generic_matches}")
+                    # Otherwise, don't include - too likely to be wrong match
+
+                # Check for substring matches of distinctive words (e.g., "Cariboo" in "Cariboo Gold")
+                for dw in distinctive_query_words:
+                    if len(dw) >= 4:  # Only check meaningful words
+                        for pw in distinctive_project_words:
+                            if dw in pw or pw in dw:
+                                if score < 0.6:
+                                    score = 0.6
+                                    match_reason.append(f"substring_match:{dw}->{pw}")
+
+            # Only include projects with meaningful scores
+            if score >= 0.5:
+                scored_projects.append((project_id, project_name, score, match_reason))
+                logger.debug(f"Fallback match: '{project_name}' score={score:.2f} reasons={match_reason}")
+
+        # Sort by score descending
+        scored_projects.sort(key=lambda x: x[2], reverse=True)
+
+        # Log the scoring for debugging
+        if scored_projects:
+            logger.info(f"Fallback project scoring for query '{query}':")
+            for pid, pname, score, reasons in scored_projects[:5]:
+                logger.info(f"  - '{pname}' (ID: {pid}) Score: {score:.2f} Reasons: {reasons}")
+
+        # Return top 3 project IDs
+        return [p[0] for p in scored_projects[:3]]
    
     def _fallback_document_extraction(self, query: str, available_document_types: Dict) -> List[str]:
         """Fallback document type extraction using comprehensive alias matching."""

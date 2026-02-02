@@ -137,13 +137,16 @@ class ProjectInferenceService:
     
     def _extract_project_entities(self, query: str) -> List[str]:
         """Extract potential project names from the query by matching against known project names.
-        
-        Uses a more targeted approach that only extracts entities that could plausibly 
+
+        Uses a more targeted approach that only extracts entities that could plausibly
         match project names in the database, focusing on actual text spans from the query.
-        
+
+        IMPORTANT: Prioritizes multi-word phrases that contain DISTINCTIVE words
+        (like "Cariboo Gold") over generic single words (like "Gold").
+
         Args:
             query (str): The search query text
-            
+
         Returns:
             List[str]: List of n-grams from the query that might match project names
         """
@@ -151,38 +154,75 @@ class ProjectInferenceService:
         projects_df = self._get_projects_cached()
         if projects_df.empty:
             return []
-        
+
+        # Generic terms that shouldn't be extracted alone
+        generic_terms = {
+            'project', 'development', 'pipeline', 'mine', 'dam', 'terminal', 'facility',
+            'energy', 'gas', 'oil', 'hydro', 'south', 'north', 'east', 'west',
+            'mountain', 'river', 'creek', 'island', 'point', 'road', 'bridge',
+            'resort', 'park', 'extension', 'expansion', 'phase', 'gold', 'copper',
+            'silver', 'coal', 'lng', 'power', 'plant', 'station', 'transmission',
+            'line', 'port', 'upper', 'lower', 'new', 'old', 'wind', 'reservoir'
+        }
+
         # Create a set of project name words for quick filtering
         project_name_words = set()
+        # Also track distinctive words from project names (non-generic)
+        distinctive_project_words = set()
         for name in projects_df['project_name'].tolist():
-            project_name_words.update(word.lower() for word in re.findall(r'\b\w+\b', str(name)))
-        
+            name_words = set(word.lower() for word in re.findall(r'\b\w+\b', str(name)))
+            project_name_words.update(name_words)
+            distinctive_project_words.update(name_words - generic_terms)
+
         query_lower = query.lower()
         words = re.findall(r'\b\w+\b', query_lower)
         candidates = []
-        
-        # Only generate n-grams that contain at least one word that appears in project names
+        candidate_scores = {}  # Track quality scores for candidates
+
+        # First pass: Look for exact project name matches in the query
+        for _, project in projects_df.iterrows():
+            project_name = str(project.get("project_name", "")).lower().strip()
+            if project_name and project_name in query_lower:
+                candidates.append(project_name)
+                candidate_scores[project_name] = 1.0  # Highest priority
+
+        # Second pass: Generate n-grams prioritizing those with distinctive words
         for n in range(1, min(6, len(words) + 1)):  # 1 to 5 words
             for i in range(len(words) - n + 1):
                 ngram_words = words[i:i+n]
                 ngram = ' '.join(ngram_words)
-                
+
                 # Skip very short phrases
                 if len(ngram) <= 3:
                     continue
-                
+
                 # Skip common non-project phrases
-                if ngram.startswith(('i am', 'i have', 'looking for', 'please find', 'that refer')):
+                if ngram.startswith(('i am', 'i have', 'looking for', 'please find', 'that refer', 'get me', 'show me')):
                     continue
-                
-                # Skip overly generic single words that appear in many project names
-                if n == 1 and ngram in {'project', 'development', 'pipeline', 'mine', 'dam', 'terminal', 'facility', 'energy', 'gas', 'oil', 'hydro', 'south', 'north', 'east', 'west', 'mountain', 'river', 'creek', 'island', 'point', 'road', 'bridge', 'resort', 'park', 'extension', 'expansion', 'phase'}:
-                    continue
-                
-                # Only include if at least one word appears in known project names
-                if any(word in project_name_words for word in ngram_words):
+
+                # For single words, ONLY accept if it's a DISTINCTIVE project word
+                if n == 1:
+                    if ngram in generic_terms:
+                        continue  # Skip generic single words
+                    if ngram not in distinctive_project_words:
+                        continue  # Skip if not a distinctive project word
+
+                # For multi-word phrases, require at least one distinctive word
+                ngram_word_set = set(ngram_words)
+                has_distinctive = bool(ngram_word_set & distinctive_project_words)
+                has_project_word = bool(ngram_word_set & project_name_words)
+
+                if has_distinctive:
+                    # High priority: contains distinctive project word
                     candidates.append(ngram)
-        
+                    # Score based on number of distinctive words
+                    distinctive_count = len(ngram_word_set & distinctive_project_words)
+                    candidate_scores[ngram] = 0.8 + (0.05 * distinctive_count)
+                elif has_project_word and n >= 2:
+                    # Lower priority: multi-word with some project words
+                    candidates.append(ngram)
+                    candidate_scores[ngram] = 0.5
+
         # Extract specific patterns around project keywords with better precision
         project_keywords = ['project', 'pipeline', 'development', 'mine', 'dam', 'terminal', 'facility']
         for keyword in project_keywords:
@@ -192,35 +232,43 @@ class ProjectInferenceService:
             for match in matches:
                 candidate = match.strip().lower()
                 if len(candidate) > 3:
-                    # Verify this candidate contains project-related words
-                    candidate_words = candidate.split()
-                    if any(word in project_name_words for word in candidate_words):
+                    # Check if candidate contains distinctive words
+                    candidate_word_set = set(candidate.split())
+                    has_distinctive = bool(candidate_word_set & distinctive_project_words)
+
+                    if has_distinctive:
                         candidates.append(candidate)
+                        candidate_scores[candidate] = 0.9
                         # Also add the full "[name] project" phrase
                         full_phrase = f"{candidate} {keyword}".lower()
                         candidates.append(full_phrase)
-        
+                        candidate_scores[full_phrase] = 0.95
+
         # Exclusion list for common non-project terms
         excluded_terms = {
             'aboriginal groups', 'indigenous groups', 'first nations', 'environmental assessment',
             'british columbia', 'environmental protection', 'climate change', 'all correspondence',
-            'please find', 'that refer', 'lheidli t enneh'
+            'please find', 'that refer', 'lheidli t enneh', 'schedule b', 'schedule a'
         }
-        
+
         # Filter out excluded terms and very generic phrases
         filtered_candidates = []
         for candidate in candidates:
             if candidate not in excluded_terms and not any(excl in candidate for excl in excluded_terms):
                 filtered_candidates.append(candidate)
-        
-        # Remove duplicates while preserving order
+
+        # Remove duplicates while preserving order, prioritize higher-scored candidates
         seen = set()
         entities = []
-        for candidate in filtered_candidates:
+        # Sort by score (highest first) before deduplication
+        scored_candidates = [(c, candidate_scores.get(c, 0.5)) for c in filtered_candidates]
+        scored_candidates.sort(key=lambda x: x[1], reverse=True)
+
+        for candidate, score in scored_candidates:
             if candidate not in seen:
                 seen.add(candidate)
                 entities.append(candidate)
-        
+
         logging.debug(f"Generated {len(entities)} candidate entities from query '{query}': {entities}")
         return entities
     
@@ -276,62 +324,129 @@ class ProjectInferenceService:
             return self._project_cache
     
     def _match_entities_to_projects(self, entities: List[str], projects_df: pd.DataFrame) -> List[Dict[str, Any]]:
-        """Match extracted entities to known projects using fuzzy matching on project names.
-        
-        This method performs case-insensitive fuzzy matching against actual project names
-        from the database, providing much more accurate matching than pattern-based approaches.
-        
+        """Match extracted entities to known projects using strict matching on project names.
+
+        This method performs case-insensitive matching against actual project names
+        from the database, with emphasis on DISTINCTIVE words rather than generic terms.
+
+        CRITICAL: When matching "Cariboo Gold", we should NOT match "Blackwater Gold"
+        just because both contain "Gold". The distinctive part is "Cariboo" vs "Blackwater".
+
         Args:
             entities (List[str]): List of candidate entity strings (already lowercase)
             projects_df (pd.DataFrame): DataFrame with project_id and project_name columns
-            
+
         Returns:
             List[Dict[str, Any]]: List of matches with similarity scores
         """
         matches = []
-        
+
+        # Generic terms that should NOT drive matching on their own
+        generic_terms = {
+            'project', 'mine', 'gold', 'copper', 'silver', 'coal', 'gas', 'oil', 'lng',
+            'power', 'energy', 'terminal', 'port', 'pipeline', 'transmission', 'line',
+            'facility', 'plant', 'station', 'expansion', 'upgrade', 'phase', 'development',
+            'mountain', 'river', 'creek', 'lake', 'park', 'resort', 'wind', 'reservoir',
+            'north', 'south', 'east', 'west', 'upper', 'lower', 'new', 'old'
+        }
+
         for entity in entities:
             entity_lower = entity.lower().strip()
-            
+            entity_words = set(entity_lower.split())
+
+            # Identify distinctive words in the entity (non-generic)
+            distinctive_entity_words = entity_words - generic_terms
+
             for _, project in projects_df.iterrows():
                 project_name = str(project.get("project_name", "")).lower().strip()
-                
+
                 # Skip empty names
                 if not project_name or project_name == "nan":
                     continue
-                
-                # Calculate similarity score using different methods
-                similarity = SequenceMatcher(None, entity_lower, project_name).ratio()
-                
-                # Boost score for exact substring matches
-                if entity_lower in project_name:
-                    similarity = max(similarity, 0.8)
-                
-                # Boost score for reverse substring matches (project name in entity)
-                if project_name in entity_lower:
-                    similarity = max(similarity, 0.9)
-                
-                # Check for word-level matches (all words in entity match words in project name)
-                entity_words = set(entity_lower.split())
+
                 project_words = set(project_name.split())
-                
-                if entity_words and entity_words.issubset(project_words):
-                    similarity = max(similarity, 0.85)
-                
-                # Use a lower threshold since we're generating more targeted candidates
-                if similarity > 0.5:  # Lowered from 0.6
+                distinctive_project_words = project_words - generic_terms
+
+                # Calculate base similarity using SequenceMatcher
+                base_similarity = SequenceMatcher(None, entity_lower, project_name).ratio()
+                similarity = base_similarity
+                match_reason = "sequence_match"
+
+                # PRIORITY 1: Exact full name match (highest confidence)
+                if entity_lower == project_name:
+                    similarity = 1.0
+                    match_reason = "exact_match"
+
+                # PRIORITY 2: Entity is exact substring of project name
+                elif entity_lower in project_name and len(entity_lower) >= 5:
+                    # Calculate how much of the project name is covered
+                    coverage = len(entity_lower) / len(project_name)
+                    similarity = max(similarity, 0.85 + (coverage * 0.1))
+                    match_reason = "substring_match"
+
+                # PRIORITY 3: Project name is exact substring of entity
+                elif project_name in entity_lower and len(project_name) >= 5:
+                    similarity = max(similarity, 0.95)
+                    match_reason = "reverse_substring"
+
+                # PRIORITY 4: Distinctive word matching (KEY FOR DISAMBIGUATION)
+                elif distinctive_entity_words and distinctive_project_words:
+                    # Calculate overlap of distinctive words
+                    distinctive_overlap = distinctive_entity_words & distinctive_project_words
+
+                    if distinctive_overlap:
+                        # Calculate what percentage of distinctive entity words matched
+                        entity_coverage = len(distinctive_overlap) / len(distinctive_entity_words)
+                        # Calculate what percentage of distinctive project words matched
+                        project_coverage = len(distinctive_overlap) / len(distinctive_project_words)
+
+                        # Use geometric mean for balanced scoring
+                        combined_coverage = (entity_coverage * project_coverage) ** 0.5
+
+                        # Strong match if most distinctive words overlap
+                        if entity_coverage >= 0.8 and project_coverage >= 0.5:
+                            similarity = max(similarity, 0.85 + (combined_coverage * 0.1))
+                            match_reason = f"distinctive_match:{distinctive_overlap}"
+                        elif entity_coverage >= 0.5:
+                            similarity = max(similarity, 0.7 + (combined_coverage * 0.15))
+                            match_reason = f"partial_distinctive:{distinctive_overlap}"
+                    else:
+                        # NO distinctive word overlap - this is likely a WRONG match
+                        # Check if only generic terms match
+                        generic_overlap = (entity_words & generic_terms) & (project_words & generic_terms)
+                        if generic_overlap and not distinctive_overlap:
+                            # PENALIZE: Only generic terms match (e.g., both have "Gold")
+                            # This is the "Cariboo Gold" vs "Blackwater Gold" case
+                            similarity = min(similarity, 0.3)  # Cap at very low similarity
+                            match_reason = f"generic_only:{generic_overlap}"
+                            logging.debug(f"Penalized generic-only match: '{entity}' vs '{project_name}' - only '{generic_overlap}' matched")
+
+                # PRIORITY 5: All entity words are subset of project words
+                elif entity_words and entity_words.issubset(project_words):
+                    similarity = max(similarity, 0.8)
+                    match_reason = "word_subset"
+
+                # Only include matches with reasonable similarity
+                if similarity >= 0.6:
                     matches.append({
                         "entity": entity,
                         "project_id": project["project_id"],
                         "project_name": project["project_name"],
                         "similarity": similarity,
-                        "match_type": "fuzzy"
+                        "match_type": "fuzzy",
+                        "match_reason": match_reason
                     })
-        
+
         # Sort by similarity score (highest first)
         matches.sort(key=lambda x: x["similarity"], reverse=True)
-        
-        logging.debug(f"Found {len(matches)} project matches with similarity > 0.5")
+
+        # Log top matches for debugging
+        if matches:
+            logging.info(f"Project matching results for entities {entities}:")
+            for m in matches[:5]:
+                logging.info(f"  - '{m['project_name']}' score={m['similarity']:.3f} reason={m.get('match_reason', 'unknown')}")
+
+        logging.debug(f"Found {len(matches)} project matches with similarity >= 0.6")
         return matches
     
     def _calculate_confidence_and_select_projects(
