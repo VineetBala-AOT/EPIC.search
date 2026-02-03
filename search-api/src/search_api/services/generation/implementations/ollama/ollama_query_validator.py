@@ -145,7 +145,7 @@ class OllamaQueryValidator(QueryValidator):
                 {"role": "user", "content": f"Validate this query: {query}"}
             ]
 
-            logger.info("Validating query relevance using Ollama function calling")
+            logger.info(f"🔍 QUERY VALIDATOR: Validating query relevance using Ollama function calling for: '{query}'")
             response = self.client.chat_completion(
                 messages=messages,
                 tools=tools,
@@ -168,7 +168,11 @@ class OllamaQueryValidator(QueryValidator):
                     validation_result["generic_response"] = generic_response
                     validation_result["recommendation"] = "return_generic_response"
 
-                logger.info(f"Query validation result: {validation_result}")
+                # Detailed logging for debugging query type detection
+                query_type = validation_result.get("query_type", "unknown")
+                recommendation = validation_result.get("recommendation", "unknown")
+                logger.info(f"🔍 QUERY VALIDATOR: LLM returned query_type='{query_type}', recommendation='{recommendation}'")
+                logger.info(f"🔍 QUERY VALIDATOR: Full validation result: {validation_result}")
                 return validation_result
             else:
                 logger.warning("No function call in response, parsing content directly")
@@ -461,9 +465,15 @@ You must call the validate_query_relevance function with your assessment."""
 
         # Check for aggregation/summary patterns
         is_aggregation = any(pattern in query_lower for pattern in aggregation_patterns)
+        matched_aggregation = [p for p in aggregation_patterns if p in query_lower]
+        if matched_aggregation:
+            logger.info(f"🔍 FALLBACK: Aggregation patterns matched: {matched_aggregation}")
 
         # Check for specific search indicators
         has_specific_indicators = any(indicator in query_lower for indicator in specific_indicators)
+        matched_specific = [i for i in specific_indicators if i in query_lower]
+        if matched_specific:
+            logger.info(f"🔍 FALLBACK: Specific indicators matched: {matched_specific}")
 
         eao_matches = sum(1 for term in eao_terms if term in full_text)
         rag_matches = sum(1 for term in rag_terms if term in full_text)
@@ -580,4 +590,5 @@ You must call the validate_query_relevance function with your assessment."""
         if category_filter:
             result["category_filter"] = category_filter
 
+        logger.info(f"🔍 FALLBACK: Final query_type='{query_type}', recommendation='{recommendation}', is_aggregation={is_aggregation}, has_specific_indicators={has_specific_indicators}")
         return result

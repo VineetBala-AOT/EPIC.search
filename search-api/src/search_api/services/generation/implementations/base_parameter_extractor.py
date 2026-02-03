@@ -642,10 +642,20 @@ that project MUST have the highest confidence. Do NOT return projects that only 
                         matched_project_id = None
                         best_match_score = 0.0
 
+                        # Debug: Show first few available projects to verify structure
+                        if available_projects:
+                            sample_project = available_projects[0]
+                            logger.info(f"Sample project structure: {list(sample_project.keys())[:5] if isinstance(sample_project, dict) else 'not a dict'}")
+                            logger.info(f"Searching {len(available_projects)} available projects for match...")
+
                         for project in available_projects:
-                            proj_name = project.get("name", "").lower()
+                            # Support both 'project_name' (API format) and 'name' (dict format) keys
+                            proj_name = (project.get("project_name") or project.get("name", "")).lower()
                             proj_id = project.get("project_id")
                             llm_name_lower = project_name_from_llm.lower()
+
+                            if not proj_name:
+                                continue  # Skip if no name found
 
                             # Exact match
                             if proj_name == llm_name_lower:

@@ -88,6 +88,7 @@ class AIHandler(BaseSearchHandler):
 
             # Handle generic informational queries (e.g., "What is EAO?")
             query_type = relevance_result.get("query_type", "specific_search")
+            current_app.logger.info(f"🔍 AI MODE: Query type from validator: '{query_type}' for query: '{query}'")
             if query_type == "generic_informational" and relevance_result.get("generic_response"):
                 current_app.logger.info("🔍 AI MODE: Generic informational query detected - returning AI-generated response")
                 metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
@@ -356,6 +357,7 @@ class AIHandler(BaseSearchHandler):
                 response_documents.append(item)
         
         current_app.logger.info(f"📊 AI MODE: Categorized {len(response_documents)} documents and {len(response_document_chunks)} document chunks")
+        current_app.logger.info(f"📊 AI MODE: is_aggregation_query={is_aggregation_query} - will {'HIDE' if is_aggregation_query else 'SHOW'} chunks")
 
         # For aggregation queries, hide the document chunks from the response
         # User only wants the AI summary (count, statistics, etc.), not the raw chunks

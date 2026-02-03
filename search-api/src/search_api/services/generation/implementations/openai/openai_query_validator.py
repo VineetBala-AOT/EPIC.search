@@ -149,7 +149,7 @@ class OpenAIQueryValidator(QueryValidator):
                 {"role": "user", "content": f"Validate this query: {query}"}
             ]
 
-            logger.info("Validating query relevance using OpenAI function calling")
+            logger.info(f"🔍 QUERY VALIDATOR: Validating query relevance using OpenAI function calling for: '{query}'")
             response = self.client.chat_completion(
                 messages=messages,
                 tools=tools,
@@ -163,7 +163,11 @@ class OpenAIQueryValidator(QueryValidator):
                 tool_call = choice["message"]["tool_calls"][0]
                 validation_result = json.loads(tool_call["function"]["arguments"])
 
-                logger.info(f"Query validation result: {validation_result}")
+                # Detailed logging for debugging query type detection
+                query_type = validation_result.get("query_type", "unknown")
+                recommendation = validation_result.get("recommendation", "unknown")
+                logger.info(f"🔍 QUERY VALIDATOR: LLM returned query_type='{query_type}', recommendation='{recommendation}'")
+                logger.info(f"🔍 QUERY VALIDATOR: Full validation result: {validation_result}")
 
                 # If it's a generic informational query, generate a helpful response
                 if validation_result.get("query_type") == "generic_informational":
@@ -443,9 +447,15 @@ When in doubt about query_type between generic and specific, choose "specific_se
 
         # Check for aggregation/summary patterns
         is_aggregation = any(pattern in query_lower for pattern in aggregation_patterns)
+        matched_aggregation = [p for p in aggregation_patterns if p in query_lower]
+        if matched_aggregation:
+            logger.info(f"🔍 FALLBACK: Aggregation patterns matched: {matched_aggregation}")
 
         # Check for specific search indicators
         has_specific_indicators = any(indicator in query_lower for indicator in specific_indicators)
+        matched_specific = [i for i in specific_indicators if i in query_lower]
+        if matched_specific:
+            logger.info(f"🔍 FALLBACK: Specific indicators matched: {matched_specific}")
 
         eao_matches = sum(1 for term in eao_terms if term in full_text)
         rag_matches = sum(1 for term in rag_terms if term in full_text)
@@ -562,4 +572,5 @@ When in doubt about query_type between generic and specific, choose "specific_se
         if category_filter:
             result["category_filter"] = category_filter
 
+        logger.info(f"🔍 FALLBACK: Final query_type='{query_type}', recommendation='{recommendation}', is_aggregation={is_aggregation}, has_specific_indicators={has_specific_indicators}")
         return result
