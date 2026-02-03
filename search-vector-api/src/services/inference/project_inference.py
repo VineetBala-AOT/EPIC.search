@@ -381,7 +381,14 @@ class ProjectInferenceService:
                 elif entity_lower in project_name and len(entity_lower) >= 5:
                     # Calculate how much of the project name is covered
                     coverage = len(entity_lower) / len(project_name)
-                    similarity = max(similarity, 0.85 + (coverage * 0.1))
+                    # Exact substring matches are strong signals - give them higher scores
+                    # If entity covers >= 50% of project name, it's likely the correct project
+                    if coverage >= 0.5:
+                        similarity = max(similarity, 0.95 + (coverage * 0.05))  # 0.95-1.0 range
+                    elif coverage >= 0.3:
+                        similarity = max(similarity, 0.90 + (coverage * 0.1))   # 0.90-0.95 range
+                    else:
+                        similarity = max(similarity, 0.85 + (coverage * 0.1))   # 0.85-0.90 range
                     match_reason = "substring_match"
 
                 # PRIORITY 3: Project name is exact substring of entity
@@ -510,27 +517,39 @@ class ProjectInferenceService:
                 individual_similarity = match["similarity"]
                 entity = match.get("entity", "")
                 entity_words = len(entity.split())
-                
-                # Very strict thresholds to prevent over-inference
-                if entity_words >= 4 and individual_similarity >= 0.90:
-                    # 4+ word entities (like "south anderson mountain resort") with very high similarity
+                match_reason = match.get("match_reason", "")
+
+                # Substring matches are very reliable - use lower thresholds
+                is_substring_match = "substring" in match_reason.lower()
+
+                # Determine threshold based on entity words and match type
+                individual_threshold = None
+                if entity_words >= 4 and individual_similarity >= 0.88:
+                    # 4+ word entities (like "south anderson mountain resort") with high similarity
+                    individual_threshold = 0.88
+                elif entity_words == 3 and individual_similarity >= 0.90:
+                    # 3-word entities need high similarity
                     individual_threshold = 0.90
-                elif entity_words == 3 and individual_similarity >= 0.93:
-                    # 3-word entities need very high similarity
-                    individual_threshold = 0.93
-                elif entity_words == 2 and individual_similarity >= 0.95:
-                    # Two-word entities need near-perfect similarity
-                    individual_threshold = 0.95
-                else:
-                    # Single words or low similarity - skip
+                elif entity_words == 2:
+                    # Two-word entities: lower threshold for substring matches
+                    if is_substring_match and individual_similarity >= 0.90:
+                        individual_threshold = 0.90
+                    elif individual_similarity >= 0.95:
+                        individual_threshold = 0.95
+                elif entity_words == 1 and is_substring_match and individual_similarity >= 0.92:
+                    # Single word substring matches (e.g., "Blackwater" in "Blackwater Gold")
+                    individual_threshold = 0.92
+
+                if individual_threshold is None:
+                    # Didn't meet any criteria - skip
                     continue
-                
+
                 if individual_similarity >= individual_threshold:
                     high_confidence_projects.append(match["project_id"])
                     individual_confidences.append(individual_similarity)
                     accepted_matches += 1
-                    logging.debug(f"Selected project '{match['project_name']}' with similarity {individual_similarity:.3f} (entity: '{entity}', words: {entity_words})")
-                
+                    logging.info(f"Selected project '{match['project_name']}' with similarity {individual_similarity:.3f} (entity: '{entity}', words: {entity_words}, reason: {match_reason})")
+
                 # Very strict limit - only accept 1 project unless we have multiple excellent matches
                 if accepted_matches >= 1:
                     break

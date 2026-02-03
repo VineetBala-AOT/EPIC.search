@@ -1105,6 +1105,25 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
                                     score = 0.6
                                     match_reason.append(f"substring_match:{dw}->{pw}")
 
+                # Check for multi-word phrases in query that match project name
+                # E.g., "cariboo gold" should strongly match "Cariboo Gold Project"
+                for ngram_len in range(2, 5):  # Check 2-4 word ngrams
+                    query_words_list = query_lower.split()
+                    for i in range(len(query_words_list) - ngram_len + 1):
+                        ngram = ' '.join(query_words_list[i:i + ngram_len])
+                        if len(ngram) >= 5 and ngram in project_name_lower:
+                            # Strong signal: multi-word phrase from query found in project name
+                            coverage = len(ngram) / len(project_name_lower)
+                            if coverage >= 0.5:
+                                new_score = 0.95 + (coverage * 0.05)
+                            elif coverage >= 0.3:
+                                new_score = 0.85 + (coverage * 0.1)
+                            else:
+                                new_score = 0.7 + (coverage * 0.1)
+                            if new_score > score:
+                                score = new_score
+                                match_reason.append(f"ngram_match:{ngram}")
+
             # Only include projects with meaningful scores
             if score >= 0.5:
                 scored_projects.append((project_id, project_name, score, match_reason))
