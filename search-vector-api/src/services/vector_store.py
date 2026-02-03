@@ -817,19 +817,22 @@ class VectorStore:
         query: str,
         limit: int = 20,
         return_dataframe: bool = True,
+        use_metadata_boost: bool = True,
     ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
         """
-        Search for chunks within specific documents using semantic search.
-        
+        Search for chunks within specific documents using semantic search with metadata boosting.
+
         This method performs semantic search on the document_chunks table,
         but only within the chunks belonging to the specified documents.
-        
+        Optionally boosts relevance scores based on chunk metadata (keywords, tags, headings).
+
         Args:
             document_ids: List of document IDs to search within.
             query: The search query text.
             limit: Maximum number of chunks to return (default: 20).
             return_dataframe: If True, returns results as a DataFrame; otherwise as a list of tuples.
-            
+            use_metadata_boost: If True, boost scores based on metadata matches (default: True).
+
         Returns:
             Either a pandas DataFrame or a list of tuples containing chunk search results.
         """
@@ -839,46 +842,96 @@ class VectorStore:
                 return pd.DataFrame(columns=["id", "metadata", "content", "document_id", "project_id", "similarity"])
             else:
                 return []
-        
+
         from .embedding import get_embedding
-        
+        from .keywords.query_keyword_extractor import get_keywords
+        from .tags.tag_extractor import get_tags
+
         start_time = time.time()
-        
+
         # Get query embedding
         query_embedding = get_embedding([query])
         embedding_list = query_embedding[0].tolist()
-        
+
+        # Extract keywords and tags from query for metadata boosting
+        query_keywords = []
+        query_tags = []
+        if use_metadata_boost:
+            try:
+                raw_keywords = get_keywords(query)
+                query_keywords = [kw for kw, score in raw_keywords] if raw_keywords else []
+                query_tags = get_tags(query) or []
+                logging.info(f"Chunk search - extracted keywords: {query_keywords[:5]}, tags: {query_tags[:5]}")
+            except Exception as e:
+                logging.warning(f"Failed to extract keywords/tags for metadata boost: {e}")
+
         # Create placeholders for document IDs
         placeholders = ','.join(['%s'] * len(document_ids))
-        
+
         # Construct the SQL query for chunk search within specific documents
+        # Uses metadata boost: adds score for chunks whose metadata matches query keywords/tags
         chunks_table = current_app.vector_settings.vector_table_name
-        # Note: document_metadata does not exist on document_chunks table
-        search_sql = f"""
-        SELECT id, metadata, content, document_id, project_id,
-               1 - (embedding <=> %s::vector) as similarity
-        FROM {chunks_table}
-        WHERE document_id IN ({placeholders})
-        ORDER BY embedding <=> %s::vector
-        LIMIT %s
-        """
-        
-        # Prepare parameters: embedding, document_ids, embedding again, limit
-        params = [embedding_list] + document_ids + [embedding_list, limit]
-        
+
+        if use_metadata_boost and (query_keywords or query_tags):
+            # Enhanced query with metadata boosting
+            # Boost formula: semantic_similarity + metadata_boost (capped at 0.15 total boost)
+            metadata_boost_parts = []
+            boost_params_before = []
+
+            if query_keywords:
+                # Boost for keyword matches in metadata
+                metadata_boost_parts.append("CASE WHEN (metadata->'keywords') ?| %s THEN 0.05 ELSE 0 END")
+                boost_params_before.append(query_keywords)
+                # Boost for heading matches
+                metadata_boost_parts.append("CASE WHEN (metadata->'headings') ?| %s THEN 0.05 ELSE 0 END")
+                boost_params_before.append(query_keywords)
+
+            if query_tags:
+                # Boost for tag matches
+                metadata_boost_parts.append("CASE WHEN (metadata->'tags') ?| %s THEN 0.05 ELSE 0 END")
+                boost_params_before.append(query_tags)
+
+            metadata_boost_sql = " + ".join(metadata_boost_parts) if metadata_boost_parts else "0"
+
+            search_sql = f"""
+            SELECT id, metadata, content, document_id, project_id,
+                   LEAST(1.0, (1 - (embedding <=> %s::vector)) + ({metadata_boost_sql})) as similarity
+            FROM {chunks_table}
+            WHERE document_id IN ({placeholders})
+            ORDER BY similarity DESC
+            LIMIT %s
+            """
+
+            # Prepare parameters: embedding, boost params, document_ids, limit
+            params = [embedding_list] + boost_params_before + document_ids + [limit]
+        else:
+            # Standard semantic-only search
+            search_sql = f"""
+            SELECT id, metadata, content, document_id, project_id,
+                   1 - (embedding <=> %s::vector) as similarity
+            FROM {chunks_table}
+            WHERE document_id IN ({placeholders})
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+            """
+
+            # Prepare parameters: embedding, document_ids, embedding again, limit
+            params = [embedding_list] + document_ids + [embedding_list, limit]
+
         # Execute the query using psycopg
         conn_params = current_app.vector_settings.database_url
         with psycopg.connect(conn_params) as conn:
             with conn.cursor() as cur:
                 cur.execute(search_sql, params)
                 results = cur.fetchall()
-        
+
         elapsed_time = time.time() - start_time
         self._log_search_time("Chunk-within-documents", elapsed_time)
-        
+        logging.info(f"Chunk search found {len(results)} results (metadata_boost={use_metadata_boost})")
+
         if return_dataframe:
             df = pd.DataFrame(
-                results, 
+                results,
                 columns=["id", "metadata", "content", "document_id", "project_id", "similarity"]
             )
             df["id"] = df["id"].astype(str)
@@ -948,6 +1001,274 @@ class VectorStore:
                 return list(embedding)
         else:
             return None
+
+    def search_documents_by_metadata(
+        self,
+        query: str,
+        limit: int = 20,
+        project_ids: Optional[List[str]] = None,
+        return_dataframe: bool = True,
+    ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
+        """
+        Search for documents using metadata fields (keywords, tags, headings).
+
+        This method searches the documents table using the pre-computed metadata
+        fields without requiring vector similarity search. Useful for quick
+        metadata-based filtering and document type inference.
+
+        Args:
+            query: The search query text.
+            limit: Maximum number of documents to return (default: 20).
+            project_ids: Optional list of project IDs to filter by.
+            return_dataframe: If True, returns results as a DataFrame.
+
+        Returns:
+            Either a pandas DataFrame or a list of tuples containing document results.
+        """
+        from .keywords.query_keyword_extractor import get_keywords
+        from .tags.tag_extractor import get_tags
+
+        start_time = time.time()
+
+        # Extract keywords and tags from query
+        try:
+            raw_keywords = get_keywords(query)
+            query_keywords = [kw for kw, score in raw_keywords] if raw_keywords else []
+        except Exception as e:
+            logging.warning(f"Failed to extract keywords: {e}")
+            query_keywords = []
+
+        try:
+            query_tags = get_tags(query) or []
+        except Exception as e:
+            logging.warning(f"Failed to extract tags: {e}")
+            query_tags = []
+
+        logging.info(f"Metadata search - query: '{query}', keywords: {query_keywords[:5]}, tags: {query_tags[:5]}")
+
+        # Build WHERE clause
+        where_conditions = ["TRUE"]
+        params = []
+        search_conditions = []
+
+        # Add keyword/tag/heading search conditions
+        if query_keywords:
+            search_conditions.append("document_keywords ?| %s")
+            params.append(query_keywords)
+            search_conditions.append("document_headings ?| %s")
+            params.append(query_keywords)
+
+        if query_tags:
+            search_conditions.append("document_tags ?| %s")
+            params.append(query_tags)
+
+        if search_conditions:
+            where_conditions.append("(" + " OR ".join(search_conditions) + ")")
+
+        # Add project filter if provided
+        if project_ids and len(project_ids) > 0:
+            placeholders = ','.join(['%s'] * len(project_ids))
+            where_conditions.append(f"project_id IN ({placeholders})")
+            params.extend(project_ids)
+
+        where_clause = " AND ".join(where_conditions)
+
+        # Build SQL query
+        documents_table = current_app.vector_settings.documents_table_name
+        search_sql = f"""
+        SELECT document_id, document_keywords, document_tags, document_headings,
+               project_id, document_metadata, created_at
+        FROM {documents_table}
+        WHERE {where_clause}
+        ORDER BY created_at DESC
+        LIMIT %s
+        """
+        params.append(limit)
+
+        # Execute query
+        conn_params = current_app.vector_settings.database_url
+        with psycopg.connect(conn_params) as conn:
+            with conn.cursor() as cur:
+                cur.execute(search_sql, params)
+                results = cur.fetchall()
+
+        elapsed_time = time.time() - start_time
+        self._log_search_time("Metadata-based document search", elapsed_time)
+        logging.info(f"Metadata search found {len(results)} documents")
+
+        if return_dataframe:
+            df = pd.DataFrame(
+                results,
+                columns=["document_id", "document_keywords", "document_tags",
+                         "document_headings", "project_id", "document_metadata", "created_at"]
+            )
+            df["document_id"] = df["document_id"].astype(str)
+            return df
+        else:
+            return results
+
+    def search_chunks_with_metadata_filter(
+        self,
+        query: str,
+        limit: int = 20,
+        project_ids: Optional[List[str]] = None,
+        document_type_ids: Optional[List[str]] = None,
+        use_semantic: bool = True,
+        return_dataframe: bool = True,
+    ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
+        """
+        Search for chunks with combined semantic search and metadata filtering.
+
+        This method performs a two-stage search:
+        1. Find documents matching project/document_type filters and metadata
+        2. Search chunks within those documents using semantic + metadata boost
+
+        Args:
+            query: The search query text.
+            limit: Maximum number of chunks to return (default: 20).
+            project_ids: Optional list of project IDs to filter by.
+            document_type_ids: Optional list of document type IDs to filter by.
+            use_semantic: If True, use semantic search; otherwise keyword-only.
+            return_dataframe: If True, returns results as a DataFrame.
+
+        Returns:
+            Either a pandas DataFrame or a list of tuples containing chunk results.
+        """
+        from .keywords.query_keyword_extractor import get_keywords
+        from .tags.tag_extractor import get_tags
+
+        start_time = time.time()
+
+        # Extract keywords and tags
+        try:
+            raw_keywords = get_keywords(query)
+            query_keywords = [kw for kw, score in raw_keywords] if raw_keywords else []
+        except Exception:
+            query_keywords = []
+
+        try:
+            query_tags = get_tags(query) or []
+        except Exception:
+            query_tags = []
+
+        logging.info(f"Chunk metadata search - keywords: {query_keywords[:5]}, tags: {query_tags[:5]}")
+
+        # Step 1: Find matching documents
+        doc_where_conditions = ["TRUE"]
+        doc_params = []
+        doc_search_conditions = []
+
+        if query_keywords:
+            doc_search_conditions.append("document_keywords ?| %s")
+            doc_params.append(query_keywords)
+            doc_search_conditions.append("document_headings ?| %s")
+            doc_params.append(query_keywords)
+
+        if query_tags:
+            doc_search_conditions.append("document_tags ?| %s")
+            doc_params.append(query_tags)
+
+        if doc_search_conditions:
+            doc_where_conditions.append("(" + " OR ".join(doc_search_conditions) + ")")
+
+        if project_ids and len(project_ids) > 0:
+            placeholders = ','.join(['%s'] * len(project_ids))
+            doc_where_conditions.append(f"project_id IN ({placeholders})")
+            doc_params.extend(project_ids)
+
+        if document_type_ids and len(document_type_ids) > 0:
+            placeholders = ','.join(['%s'] * len(document_type_ids))
+            doc_where_conditions.append(f"document_metadata->>'document_type_id' IN ({placeholders})")
+            doc_params.extend(document_type_ids)
+
+        doc_where_clause = " AND ".join(doc_where_conditions)
+
+        # Query for document IDs
+        documents_table = current_app.vector_settings.documents_table_name
+        doc_sql = f"""
+        SELECT document_id
+        FROM {documents_table}
+        WHERE {doc_where_clause}
+        ORDER BY created_at DESC
+        LIMIT 100
+        """
+
+        conn_params = current_app.vector_settings.database_url
+        with psycopg.connect(conn_params) as conn:
+            with conn.cursor() as cur:
+                cur.execute(doc_sql, doc_params)
+                doc_results = cur.fetchall()
+
+        document_ids = [str(r[0]) for r in doc_results]
+        logging.info(f"Chunk metadata search - found {len(document_ids)} matching documents")
+
+        if not document_ids:
+            elapsed_time = time.time() - start_time
+            self._log_search_time("Chunk metadata search (no docs)", elapsed_time)
+            if return_dataframe:
+                return pd.DataFrame(columns=["id", "metadata", "content", "document_id", "project_id", "similarity"])
+            else:
+                return []
+
+        # Step 2: Search chunks within matching documents
+        if use_semantic:
+            # Use the enhanced search with metadata boost
+            return self.search_chunks_by_documents(
+                document_ids=document_ids,
+                query=query,
+                limit=limit,
+                return_dataframe=return_dataframe,
+                use_metadata_boost=True
+            )
+        else:
+            # Keyword-only chunk search
+            chunks_table = current_app.vector_settings.vector_table_name
+            placeholders = ','.join(['%s'] * len(document_ids))
+            chunk_where_conditions = [f"document_id IN ({placeholders})"]
+            chunk_params = document_ids.copy()
+            chunk_search_conditions = []
+
+            if query_keywords:
+                chunk_search_conditions.append("(metadata->'keywords') ?| %s")
+                chunk_params.append(query_keywords)
+                chunk_search_conditions.append("(metadata->'headings') ?| %s")
+                chunk_params.append(query_keywords)
+
+            if query_tags:
+                chunk_search_conditions.append("(metadata->'tags') ?| %s")
+                chunk_params.append(query_tags)
+
+            if chunk_search_conditions:
+                chunk_where_conditions.append("(" + " OR ".join(chunk_search_conditions) + ")")
+
+            chunk_where_clause = " AND ".join(chunk_where_conditions)
+            chunk_sql = f"""
+            SELECT id, metadata, content, document_id, project_id, 0.5 as similarity
+            FROM {chunks_table}
+            WHERE {chunk_where_clause}
+            ORDER BY id DESC
+            LIMIT %s
+            """
+            chunk_params.append(limit)
+
+            with psycopg.connect(conn_params) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(chunk_sql, chunk_params)
+                    results = cur.fetchall()
+
+            elapsed_time = time.time() - start_time
+            self._log_search_time("Chunk metadata search", elapsed_time)
+
+            if return_dataframe:
+                df = pd.DataFrame(
+                    results,
+                    columns=["id", "metadata", "content", "document_id", "project_id", "similarity"]
+                )
+                df["id"] = df["id"].astype(str)
+                df["document_id"] = df["document_id"].astype(str)
+                return df
+            else:
+                return results
 
     def document_similarity_search(
         self,

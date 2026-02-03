@@ -40,10 +40,11 @@ class InferencePipeline:
         skip_generic_cleaning: bool = False,
         run_project_inference: bool = True,
         run_document_type_inference: bool = True,
-        use_project_metadata: bool = False
+        use_project_metadata: bool = False,
+        use_database_doc_type_inference: bool = True
     ) -> Dict[str, Any]:
         """Process a search query through the complete inference pipeline.
-        
+
         Args:
             query (str): The natural language search query
             project_ids (Optional[List[str]]): Explicit project IDs (skips project inference if provided)
@@ -51,7 +52,8 @@ class InferencePipeline:
             skip_generic_cleaning (bool): Whether to skip query cleaning for generic requests
             run_project_inference (bool): Whether to run project inference (default: True)
             run_document_type_inference (bool): Whether to run document type inference (default: True)
-            
+            use_database_doc_type_inference (bool): Whether to use database metadata for document type inference (default: True)
+
         Returns:
             Dict[str, Any]: Complete inference results including:
                 - final_query: The processed query after all inference steps
@@ -110,7 +112,7 @@ class InferencePipeline:
         if (not document_type_ids or (isinstance(document_type_ids, list) and len(document_type_ids) == 0)) and run_document_type_inference:
             logging.info(f"Starting document type inference for query: '{processing_state['current_query']}'")
             doc_type_results = self._process_document_type_inference(
-                processing_state, is_generic_request
+                processing_state, is_generic_request, use_database_inference=use_database_doc_type_inference
             )
             # Always save the inference metadata, regardless of whether it's applied
             processing_state["inferred_document_type_ids"] = doc_type_results["inferred_document_type_ids"]
@@ -212,28 +214,42 @@ class InferencePipeline:
         return result
         
     def _process_document_type_inference(
-        self, 
-        processing_state: Dict[str, Any], 
-        is_generic_request: bool
+        self,
+        processing_state: Dict[str, Any],
+        is_generic_request: bool,
+        use_database_inference: bool = True
     ) -> Dict[str, Any]:
         """Process document type inference step.
-        
+
         Args:
             processing_state (Dict[str, Any]): Current processing state
             is_generic_request (bool): Whether this is a generic request
-            
+            use_database_inference (bool): Whether to use database metadata for enhanced inference
+
         Returns:
             Dict[str, Any]: Document type inference results
         """
         from .document_type_inference import document_type_inference_service
-        
+
         # Use the original query for document type inference (document type terms are in the original query)
         query_for_inference = processing_state["original_query"]
-        
-        # Perform document type inference
-        inferred_doc_type_ids, doc_type_confidence, doc_type_metadata = document_type_inference_service.infer_document_types_from_query(
-            query_for_inference
-        )
+
+        # Get inferred project IDs to scope database search (if available)
+        project_ids = processing_state.get("inferred_project_ids")
+
+        # Perform document type inference - use combined method if database inference is enabled
+        if use_database_inference:
+            logging.info("Using combined alias + database document type inference")
+            inferred_doc_type_ids, doc_type_confidence, doc_type_metadata = document_type_inference_service.infer_with_combined_methods(
+                query_for_inference,
+                project_ids=project_ids,
+                confidence_threshold=self.document_type_confidence_threshold
+            )
+        else:
+            # Use alias-only inference
+            inferred_doc_type_ids, doc_type_confidence, doc_type_metadata = document_type_inference_service.infer_document_types_from_query(
+                query_for_inference
+            )
         
         result = {
             "inferred_document_type_ids": inferred_doc_type_ids or [],

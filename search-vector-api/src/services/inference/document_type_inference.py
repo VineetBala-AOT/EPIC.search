@@ -1,21 +1,22 @@
 """Document type inference service for automatically detecting document type references in search queries.
 
 This module provides intelligent document type detection capabilities that analyze user queries
-to identify document type names and related terms. When users ask questions like "I am looking 
-for the Inspection Record for project X" or "show me the Environmental Assessment reports", 
-the system can automatically infer which document type(s) they're referring to and apply 
+to identify document type names and related terms. When users ask questions like "I am looking
+for the Inspection Record for project X" or "show me the Environmental Assessment reports",
+the system can automatically infer which document type(s) they're referring to and apply
 appropriate filtering.
 
 The service includes:
 1. Fuzzy matching against comprehensive document type alias dictionaries
-2. Confidence scoring for automatic document type inference
-3. Query cleaning to remove identified document type references
-4. Integration with the search pipeline for transparent document type filtering
+2. Database-backed inference using document metadata, keywords, tags, and headings
+3. Confidence scoring for automatic document type inference
+4. Query cleaning to remove identified document type references
+5. Integration with the search pipeline for transparent document type filtering
 """
 
 import re
 import logging
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from difflib import SequenceMatcher
 
 class DocumentTypeInferenceService:
@@ -211,16 +212,16 @@ class DocumentTypeInferenceService:
 
     def clean_query_after_inference(self, query: str, inference_metadata: Dict[str, Any]) -> str:
         """Clean the query by removing identified document type references.
-        
+
         Args:
             query (str): The original search query
             inference_metadata (Dict[str, Any]): Metadata from the inference process
-            
+
         Returns:
             str: Cleaned query with document type references removed
         """
         cleaned_query = query
-        
+
         # Remove matched document type terms
         matched_types = inference_metadata.get("matched_document_types", [])
         for match in matched_types:
@@ -233,16 +234,232 @@ class DocumentTypeInferenceService:
                 else:
                     # For exact matches, remove the matched alias term
                     term_to_remove = matched_term
-                
+
                 # Remove the term using word boundary matching (case insensitive)
                 pattern = r'\b' + re.escape(term_to_remove) + r'\b'
                 cleaned_query = re.sub(pattern, '', cleaned_query, flags=re.IGNORECASE)
-        
+
         # Clean up extra whitespace
         cleaned_query = ' '.join(cleaned_query.split())
-        
+
         logging.debug(f"Query cleaning: '{query}' → '{cleaned_query}'")
         return cleaned_query
+
+    def infer_from_database_metadata(
+        self,
+        query: str,
+        project_ids: Optional[List[str]] = None,
+        limit: int = 50
+    ) -> Tuple[List[str], float, Dict[str, Any]]:
+        """Infer document types by analyzing database document metadata.
+
+        This method queries the database to find documents matching the query
+        based on keywords, tags, and headings, then analyzes the document_type_id
+        distribution to suggest relevant document types.
+
+        Args:
+            query: The search query text.
+            project_ids: Optional list of project IDs to scope the search.
+            limit: Maximum documents to analyze (default: 50).
+
+        Returns:
+            tuple: A tuple containing:
+                - List[str]: Inferred document type IDs
+                - float: Confidence score (0.0 to 1.0)
+                - Dict[str, Any]: Detailed inference metadata
+        """
+        try:
+            from flask import current_app
+            import psycopg
+
+            # Extract keywords and tags from query
+            try:
+                from services.keywords.query_keyword_extractor import get_keywords
+                from services.tags.tag_extractor import get_tags
+                raw_keywords = get_keywords(query)
+                query_keywords = [kw for kw, score in raw_keywords] if raw_keywords else []
+                query_tags = get_tags(query) or []
+            except Exception as e:
+                logging.warning(f"Failed to extract keywords/tags: {e}")
+                query_keywords = query.lower().split()
+                query_tags = []
+
+            logging.info(f"Database document type inference - query: '{query}', keywords: {query_keywords[:5]}")
+
+            # Build WHERE clause for document search
+            where_conditions = ["TRUE"]
+            params = []
+            search_conditions = []
+
+            if query_keywords:
+                search_conditions.append("document_keywords ?| %s")
+                params.append(query_keywords)
+                search_conditions.append("document_headings ?| %s")
+                params.append(query_keywords)
+
+            if query_tags:
+                search_conditions.append("document_tags ?| %s")
+                params.append(query_tags)
+
+            if search_conditions:
+                where_conditions.append("(" + " OR ".join(search_conditions) + ")")
+
+            if project_ids and len(project_ids) > 0:
+                placeholders = ','.join(['%s'] * len(project_ids))
+                where_conditions.append(f"project_id IN ({placeholders})")
+                params.extend(project_ids)
+
+            where_clause = " AND ".join(where_conditions)
+
+            # Query for document type distribution
+            documents_table = current_app.vector_settings.documents_table_name
+            sql = f"""
+            SELECT
+                document_metadata->>'document_type_id' as doc_type_id,
+                document_metadata->>'document_type' as doc_type_name,
+                COUNT(*) as doc_count
+            FROM {documents_table}
+            WHERE {where_clause}
+              AND document_metadata->>'document_type_id' IS NOT NULL
+            GROUP BY document_metadata->>'document_type_id', document_metadata->>'document_type'
+            ORDER BY doc_count DESC
+            LIMIT %s
+            """
+            params.append(limit)
+
+            conn_params = current_app.vector_settings.database_url
+            with psycopg.connect(conn_params) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    results = cur.fetchall()
+
+            if not results:
+                logging.info("Database inference: No matching documents found")
+                return [], 0.0, {
+                    "method": "database_metadata",
+                    "documents_analyzed": 0,
+                    "reasoning": ["No documents matched the query keywords/tags"]
+                }
+
+            # Analyze document type distribution
+            total_docs = sum(r[2] for r in results)
+            doc_type_distribution = []
+            for doc_type_id, doc_type_name, count in results:
+                percentage = count / total_docs if total_docs > 0 else 0
+                doc_type_distribution.append({
+                    "type_id": doc_type_id,
+                    "type_name": doc_type_name,
+                    "count": count,
+                    "percentage": round(percentage, 3)
+                })
+
+            # Determine confidence based on distribution concentration
+            # If one type dominates (>50%), high confidence; otherwise lower
+            top_type = doc_type_distribution[0] if doc_type_distribution else None
+            if top_type and top_type["percentage"] >= 0.5:
+                confidence = 0.8 + (top_type["percentage"] - 0.5) * 0.4  # 0.8-1.0
+                inferred_ids = [top_type["type_id"]]
+                reasoning = [f"Dominant document type: {top_type['type_name']} ({top_type['percentage']*100:.1f}% of {total_docs} matching docs)"]
+            elif top_type and top_type["percentage"] >= 0.3:
+                confidence = 0.6 + (top_type["percentage"] - 0.3) * 0.5  # 0.6-0.8
+                # Include top 2 types if second is significant
+                inferred_ids = [top_type["type_id"]]
+                if len(doc_type_distribution) > 1 and doc_type_distribution[1]["percentage"] >= 0.2:
+                    inferred_ids.append(doc_type_distribution[1]["type_id"])
+                reasoning = [f"Primary document type: {top_type['type_name']} ({top_type['percentage']*100:.1f}%)"]
+            else:
+                # Low concentration - include top 3 types
+                confidence = 0.4 + (top_type["percentage"] if top_type else 0) * 0.5
+                inferred_ids = [d["type_id"] for d in doc_type_distribution[:3]]
+                reasoning = ["Multiple document types found, no dominant type"]
+
+            logging.info(f"Database inference: Found {len(inferred_ids)} types with {confidence:.2f} confidence")
+
+            return inferred_ids, confidence, {
+                "method": "database_metadata",
+                "documents_analyzed": total_docs,
+                "distribution": doc_type_distribution[:5],  # Top 5 for debugging
+                "reasoning": reasoning,
+                "query_keywords": query_keywords[:10],
+                "query_tags": query_tags[:5]
+            }
+
+        except Exception as e:
+            logging.error(f"Database document type inference failed: {e}")
+            return [], 0.0, {
+                "method": "database_metadata",
+                "error": str(e),
+                "reasoning": ["Database inference failed, falling back to alias matching"]
+            }
+
+    def infer_with_combined_methods(
+        self,
+        query: str,
+        project_ids: Optional[List[str]] = None,
+        confidence_threshold: float = 0.7
+    ) -> Tuple[List[str], float, Dict[str, Any]]:
+        """Infer document types using combined alias matching and database analysis.
+
+        This method first tries alias-based matching, then enhances results with
+        database metadata analysis for higher accuracy.
+
+        Args:
+            query: The search query text.
+            project_ids: Optional project IDs to scope database search.
+            confidence_threshold: Minimum confidence for inference.
+
+        Returns:
+            tuple: A tuple containing:
+                - List[str]: Inferred document type IDs
+                - float: Combined confidence score
+                - Dict[str, Any]: Detailed inference metadata
+        """
+        # Step 1: Try alias-based matching
+        alias_ids, alias_conf, alias_meta = self.infer_document_types_from_query(query, confidence_threshold)
+
+        # Step 2: Try database-based matching
+        db_ids, db_conf, db_meta = self.infer_from_database_metadata(query, project_ids)
+
+        # Combine results
+        if alias_ids and alias_conf >= confidence_threshold:
+            # Alias matching succeeded with high confidence
+            if db_ids and db_conf >= 0.5:
+                # Database also found types - merge if they agree
+                combined_ids = list(set(alias_ids + db_ids))
+                combined_conf = max(alias_conf, db_conf)
+                method = "combined_alias_and_database"
+            else:
+                combined_ids = alias_ids
+                combined_conf = alias_conf
+                method = "alias_matching"
+        elif db_ids and db_conf >= confidence_threshold:
+            # Only database matching succeeded
+            combined_ids = db_ids
+            combined_conf = db_conf
+            method = "database_metadata"
+        elif alias_ids or db_ids:
+            # Lower confidence results available
+            combined_ids = alias_ids if alias_ids else db_ids
+            combined_conf = max(alias_conf, db_conf)
+            method = "low_confidence_fallback"
+        else:
+            # No results from either method
+            combined_ids = []
+            combined_conf = 0.0
+            method = "no_match"
+
+        logging.info(f"Combined inference: {len(combined_ids)} types, {combined_conf:.2f} confidence, method={method}")
+
+        return combined_ids, combined_conf, {
+            "method": method,
+            "alias_inference": alias_meta,
+            "database_inference": db_meta,
+            "reasoning": [
+                f"Alias matching: {len(alias_ids)} types at {alias_conf:.2f} confidence",
+                f"Database matching: {len(db_ids)} types at {db_conf:.2f} confidence",
+                f"Final: {len(combined_ids)} types using {method}"
+            ]
+        }
 
 
 # Create a singleton instance for easy importing
