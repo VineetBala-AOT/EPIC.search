@@ -87,9 +87,16 @@ class BaseSearchHandler(ABC):
             metrics["llm_model"] = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
         else:
             metrics["llm_model"] = os.getenv("LLM_MODEL", "")
-        
+
         current_app.logger.info(f"LLM Configuration - Provider: {metrics['llm_provider']}, Model: {metrics['llm_model']}")
-        
+
+        # Log the search parameters being passed
+        current_app.logger.info(f"🔎 SEARCH PARAMS: project_ids={project_ids}")
+        current_app.logger.info(f"🔎 SEARCH PARAMS: document_type_ids={document_type_ids}")
+        current_app.logger.info(f"🔎 SEARCH PARAMS: search_strategy={search_strategy}")
+        current_app.logger.info(f"🔎 SEARCH PARAMS: semantic_query={semantic_query}")
+        current_app.logger.info(f"🔎 SEARCH PARAMS: location={location}, project_status={project_status}, years={years}")
+
         # Perform the vector DB search by calling the vector search api
         current_app.logger.info("Starting vector search...")
         search_start = time.time()

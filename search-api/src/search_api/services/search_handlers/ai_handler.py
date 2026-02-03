@@ -283,7 +283,24 @@ class AIHandler(BaseSearchHandler):
         
         # AI mode uses only LLM-extracted parameters (no pattern-based fallback)
         current_app.logger.info("🎯 AI MODE: Using LLM-extracted parameters (no pattern-based fallback)")
+        current_app.logger.info(f"🎯 AI MODE: Final project_ids to search: {project_ids}")
+        current_app.logger.info(f"🎯 AI MODE: Final document_type_ids to search: {document_type_ids}")
         current_app.logger.info(f"🎯 AI MODE: Final parameters - location (inferred): {final_location}, status: {final_project_status}, years: {final_years}")
+
+        # For specific content queries (asking about content WITHIN documents), avoid restrictive document type filtering
+        # The semantic search is better at finding relevant content than hard filtering
+        query_lower = query.lower()
+        specific_content_indicators = [
+            "does the", "what does", "is there", "are there", "mentions", "mention",
+            "contain", "contains", "refer to", "refers to", "say about", "says about",
+            "condition about", "condition that", "conditions for", "schedule b", "schedule a"
+        ]
+        is_specific_content_query = any(indicator in query_lower for indicator in specific_content_indicators)
+
+        if is_specific_content_query and project_ids and document_type_ids:
+            current_app.logger.info("🎯 AI MODE: Specific content query detected with both project and doc type filters")
+            current_app.logger.info("🎯 AI MODE: Relaxing document type filter to let semantic search find relevant content")
+            document_type_ids = None  # Let semantic search find content across all document types
         
         # Execute vector search with optimized parameters
         current_app.logger.info("🔍 AI MODE: Executing vector search...")

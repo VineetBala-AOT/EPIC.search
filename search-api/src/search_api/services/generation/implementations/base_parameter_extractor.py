@@ -781,7 +781,9 @@ Return `[]` (no specific types) only if:
 | application, form, submission materials | **Application Materials**, **Application Information Requirement** |
 | plan, management plan, mitigation plan | **Plan**, **Management Plan** |
 | report, study, technical paper, analysis | **Report/Study**, **Scientific Memo**, **Independent Memo** |
-| certificate, EA certificate, permit | **Certificate Package**, **Order** |
+| certificate, EA certificate, permit, EAC | **Certificate Package**, **Order** |
+| Schedule B, conditions, certificate conditions | **Certificate Package**, **Order** (Schedule B contains certificate conditions) |
+| Schedule A, certified project description | **Certificate Package**, **Order** (Schedule A contains project description) |
 | notification, announcement, advertisement | **Notification**, **Ad/News Release** |
 | inspection, compliance check | **Inspection Record** |
 | agreement, MOU | **Agreement** |
@@ -789,6 +791,11 @@ Return `[]` (no specific types) only if:
 | project description, overview | **Project Description**, **Project Descriptions** |
 | presentation, slides | **Presentation** |
 | tracking, index | **Tracking Table** |
+
+**IMPORTANT**: Schedule B and Schedule A are part of Environmental Assessment Certificates:
+- **Schedule B** = Certificate Conditions (requirements the proponent must meet)
+- **Schedule A** = Certified Project Description
+When users ask about "Schedule B" or "conditions", match to **Certificate Package** or **Order** document types.
 
 ---
 
@@ -1258,7 +1265,10 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
             return []
        
         # Only do text matching for queries that explicitly mention document types
-        document_type_keywords = ["letter", "report", "memo", "correspondence", "transcript", "assessment", "presentation"]
+        document_type_keywords = [
+            "letter", "report", "memo", "correspondence", "transcript", "assessment", "presentation",
+            "schedule", "condition", "certificate", "eac", "order", "package", "application", "agreement"
+        ]
         if not any(keyword in query_lower for keyword in document_type_keywords):
             logger.info(f"Query does not mention specific document types - returning empty array")
             logger.info("=== END FALLBACK DOCUMENT TYPE EXTRACTION ===")
