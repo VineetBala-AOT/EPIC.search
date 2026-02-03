@@ -616,6 +616,69 @@ that project MUST have the highest confidence. Do NOT return projects that only 
                     logger.warning(f"Using fallback array format, got {len(result)} project IDs: {result}")
                     logger.info("=== PROJECT ID EXTRACTION END ===")
                     return result[:3]  # Limit to 3 for focused results
+                elif '|' in content and 'Confidence:' in content:
+                    # Handle pipe-delimited format: "Project Name | Confidence: 0.95 | Reason: ..."
+                    logger.info("Detected pipe-delimited LLM response format, parsing...")
+
+                    # Parse the pipe-delimited format
+                    parts = [p.strip() for p in content.split('|')]
+                    if len(parts) >= 2:
+                        project_name_from_llm = parts[0].strip()
+
+                        # Extract confidence score
+                        confidence = 0.0
+                        for part in parts:
+                            if 'Confidence:' in part:
+                                try:
+                                    conf_str = part.split('Confidence:')[1].strip()
+                                    confidence = float(conf_str)
+                                except (ValueError, IndexError):
+                                    confidence = 0.0
+
+                        logger.info(f"Parsed from pipe format: project='{project_name_from_llm}', confidence={confidence}")
+
+                        # Find matching project by name (case-insensitive)
+                        valid_ids = {p.get("project_id") for p in available_projects if p.get("project_id")}
+                        matched_project_id = None
+                        best_match_score = 0.0
+
+                        for project in available_projects:
+                            proj_name = project.get("name", "").lower()
+                            proj_id = project.get("project_id")
+                            llm_name_lower = project_name_from_llm.lower()
+
+                            # Exact match
+                            if proj_name == llm_name_lower:
+                                matched_project_id = proj_id
+                                best_match_score = 1.0
+                                logger.info(f"  Exact name match: '{proj_name}' -> ID: {proj_id}")
+                                break
+
+                            # Substring match (LLM name in project name or vice versa)
+                            if llm_name_lower in proj_name or proj_name in llm_name_lower:
+                                # Calculate match quality based on length overlap
+                                overlap = len(set(llm_name_lower.split()) & set(proj_name.split()))
+                                total_words = max(len(llm_name_lower.split()), len(proj_name.split()))
+                                score = overlap / total_words if total_words > 0 else 0
+
+                                if score > best_match_score:
+                                    best_match_score = score
+                                    matched_project_id = proj_id
+                                    logger.info(f"  Substring match: '{proj_name}' score={score:.2f} -> ID: {proj_id}")
+
+                        if matched_project_id and confidence >= 0.7:
+                            logger.info(f"Pipe-delimited parsing successful: project_id={matched_project_id}, confidence={confidence}")
+                            logger.info("=== PROJECT ID EXTRACTION END ===")
+                            return [matched_project_id]
+                        else:
+                            logger.warning(f"Pipe-delimited parsing found match but confidence too low ({confidence}) or no match found, using fallback")
+                    else:
+                        logger.warning("Pipe-delimited format not parseable, using fallback")
+
+                    result = self._fallback_project_extraction(query, available_projects)
+                    logger.info(f"Fallback extraction result: {result}")
+                    logger.info("=== PROJECT ID EXTRACTION END ===")
+                    return result
                 else:
                     logger.warning("LLM response not in expected JSON format, using fallback")
                     result = self._fallback_project_extraction(query, available_projects)
@@ -1023,11 +1086,24 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
         scored_projects = []
 
         # Common generic terms that should not drive matching
+        # Includes industry terms, geographic regions, and generic project words
         generic_terms = {
+            # Geographic/terrain features
             'mountain', 'river', 'creek', 'lake', 'park', 'resort', 'wind', 'reservoir',
+            'island', 'valley', 'coast', 'coastal', 'bay', 'inlet', 'sound', 'strait',
+            # Geographic regions (should not match on location alone)
+            'mainland', 'lower', 'upper', 'interior', 'northern', 'southern', 'eastern', 'western',
+            'north', 'south', 'east', 'west', 'central', 'vancouver', 'victoria', 'bc', 'british', 'columbia',
+            # Industry terms (but NOT project-distinctive words like 'marine', 'tilbury', etc.)
             'project', 'mine', 'gold', 'copper', 'silver', 'coal', 'gas', 'oil', 'lng',
             'power', 'energy', 'terminal', 'port', 'pipeline', 'transmission', 'line',
-            'facility', 'plant', 'station', 'expansion', 'upgrade', 'phase', 'development'
+            'facility', 'plant', 'station', 'expansion', 'upgrade', 'phase', 'development',
+            # Additional generic terms
+            'clean', 'hydro', 'electric', 'solar', 'thermal', 'nuclear',
+            'storage', 'processing', 'refinery', 'smelter', 'mill', 'quarry',
+            # Query terms that shouldn't drive matching
+            'impact', 'impacts', 'effect', 'effects', 'salmon', 'fish', 'water', 'air',
+            'environment', 'environmental', 'assessment', 'near', 'due', 'ports'
         }
         stop_words = {'the', 'and', 'or', 'of', 'in', 'at', 'to', 'for', 'with', 'by', 'a', 'an', 'get', 'me', 'show', 'find'}
 
@@ -1112,17 +1188,30 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
                     for i in range(len(query_words_list) - ngram_len + 1):
                         ngram = ' '.join(query_words_list[i:i + ngram_len])
                         if len(ngram) >= 5 and ngram in project_name_lower:
-                            # Strong signal: multi-word phrase from query found in project name
-                            coverage = len(ngram) / len(project_name_lower)
-                            if coverage >= 0.5:
-                                new_score = 0.95 + (coverage * 0.05)
-                            elif coverage >= 0.3:
-                                new_score = 0.85 + (coverage * 0.1)
+                            # Check if ngram is composed only of generic/location terms
+                            ngram_words = set(ngram.split())
+                            ngram_distinctive_words = ngram_words - generic_terms - stop_words
+
+                            # If ngram has no distinctive words, reduce its weight significantly
+                            # E.g., "lower mainland" matches many projects but isn't project-specific
+                            if not ngram_distinctive_words:
+                                # Generic-only ngram - much lower score
+                                new_score = 0.4  # Weak signal
+                                if new_score > score:
+                                    score = new_score
+                                    match_reason.append(f"ngram_match_generic:{ngram}")
                             else:
-                                new_score = 0.7 + (coverage * 0.1)
-                            if new_score > score:
-                                score = new_score
-                                match_reason.append(f"ngram_match:{ngram}")
+                                # Strong signal: multi-word phrase with distinctive words
+                                coverage = len(ngram) / len(project_name_lower)
+                                if coverage >= 0.5:
+                                    new_score = 0.95 + (coverage * 0.05)
+                                elif coverage >= 0.3:
+                                    new_score = 0.85 + (coverage * 0.1)
+                                else:
+                                    new_score = 0.7 + (coverage * 0.1)
+                                if new_score > score:
+                                    score = new_score
+                                    match_reason.append(f"ngram_match:{ngram}")
 
             # Only include projects with meaningful scores
             if score >= 0.5:

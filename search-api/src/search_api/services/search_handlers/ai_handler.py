@@ -48,7 +48,10 @@ class AIHandler(BaseSearchHandler):
         """
         start_time = time.time()
         current_app.logger.info("=== AI MODE: Starting LLM parameter extraction + AI summarization processing ===")
-        
+
+        # Track if this is an aggregation query (initialized here, set after relevance check)
+        is_aggregation_query = False
+
         # Check query relevance up front
         current_app.logger.info("🔍 AI MODE: Checking query relevance...")
         relevance_start = time.time()
@@ -116,6 +119,12 @@ class AIHandler(BaseSearchHandler):
                     metrics=metrics,
                     start_time=start_time
                 )
+
+            # Track if this is an aggregation query (we'll handle it later after search)
+            is_aggregation_query = (query_type == "aggregation_summary")
+            if is_aggregation_query:
+                current_app.logger.info("🔍 AI MODE: Aggregation/summary query detected - will hide chunks from response")
+                metrics["query_type"] = "aggregation_summary"
 
         except Exception as e:
             current_app.logger.error(f"🔍 AI MODE: Relevance check failed: {e}")
@@ -348,6 +357,14 @@ class AIHandler(BaseSearchHandler):
         
         current_app.logger.info(f"📊 AI MODE: Categorized {len(response_documents)} documents and {len(response_document_chunks)} document chunks")
 
+        # For aggregation queries, hide the document chunks from the response
+        # User only wants the AI summary (count, statistics, etc.), not the raw chunks
+        if is_aggregation_query:
+            current_app.logger.info("📊 AI MODE: Aggregation query - hiding document chunks from response (AI summary only)")
+            response_document_chunks = []  # Clear chunks for aggregation queries
+            metrics["chunks_hidden"] = True
+            metrics["chunks_hidden_reason"] = "aggregation_summary_query"
+
         return {
             "result": {
                 "response": summary_result.get("response", "No response generated"),
@@ -356,7 +373,8 @@ class AIHandler(BaseSearchHandler):
                 "metrics": metrics,
                 "search_quality": search_result["search_quality"],
                 "project_inference": search_result["project_inference"],
-                "document_type_inference": search_result["document_type_inference"]
+                "document_type_inference": search_result["document_type_inference"],
+                "query_type": "aggregation_summary" if is_aggregation_query else "specific_search"
             }
         }
 

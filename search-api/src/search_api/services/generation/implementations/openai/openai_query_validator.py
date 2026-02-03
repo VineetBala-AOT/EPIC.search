@@ -116,8 +116,8 @@ class OpenAIQueryValidator(QueryValidator):
                             },
                             "query_type": {
                                 "type": "string",
-                                "enum": ["generic_informational", "specific_search", "ambiguous", "broad_category_search"],
-                                "description": "Type of query: generic_informational (general questions about EAO), specific_search (queries about specific projects/documents), broad_category_search (queries asking about a category of projects like 'mining projects' or 'LNG projects'), or ambiguous"
+                                "enum": ["generic_informational", "specific_search", "aggregation_summary", "ambiguous", "broad_category_search"],
+                                "description": "Type of query: generic_informational (general questions about EAO), specific_search (queries about specific projects/documents that need document chunks returned), aggregation_summary (queries asking for counts, statistics, or summaries across documents - return AI summary only, no chunks), broad_category_search (queries asking about a category of projects like 'mining projects' or 'LNG projects'), or ambiguous"
                             },
                             "category_filter": {
                                 "type": "string",
@@ -131,8 +131,8 @@ class OpenAIQueryValidator(QueryValidator):
                             },
                             "recommendation": {
                                 "type": "string",
-                                "enum": ["proceed_with_search", "return_generic_response", "inform_user_out_of_scope", "return_category_list"],
-                                "description": "Recommendation: proceed_with_search for specific queries, return_generic_response for generic informational queries, return_category_list for broad category searches, inform_user_out_of_scope for irrelevant queries"
+                                "enum": ["proceed_with_search", "proceed_with_aggregation", "return_generic_response", "inform_user_out_of_scope", "return_category_list"],
+                                "description": "Recommendation: proceed_with_search for specific queries (return chunks), proceed_with_aggregation for count/summary queries (return only AI summary, no chunks), return_generic_response for generic informational queries, return_category_list for broad category searches, inform_user_out_of_scope for irrelevant queries"
                             },
                             "suggested_response": {
                                 "type": "string",
@@ -292,15 +292,26 @@ The EAO's scope includes:
    - "What is an Environmental Assessment Certificate?"
    These should return a general informational response WITHOUT searching the database.
 
-2. **SPECIFIC SEARCH** queries are looking for information about specific projects, documents, or entities:
+2. **SPECIFIC SEARCH** queries are looking for information about specific projects, documents, or content:
    - "Schedule B for Cariboo Gold" (specific project + document type)
+   - "Does the Schedule B for Cariboo Gold have a condition that refers specifically to the Caribou?" (specific content question)
    - "Letters from Ministry of Environment about Blackwater Gold"
    - "What conditions are in the KSM Project certificate?"
    - "Documents mentioning Nooaitch Indian Band"
-   - "Environmental assessment for Roberts Bank Terminal 2"
-   These should SEARCH the database for specific documents.
+   - "What does the certificate say about fish habitat?"
+   These should SEARCH the database and RETURN document chunks so users can see the specific content.
 
-3. **BROAD CATEGORY SEARCH** queries are asking about a CATEGORY of projects without specifying a particular one:
+3. **AGGREGATION SUMMARY** queries ask for counts, statistics, or summaries across multiple documents:
+   - "How many certificates were given in 2024?" (counting documents)
+   - "How many projects have Schedule B conditions about caribou?" (counting/aggregating)
+   - "What percentage of mining projects were approved?" (statistics)
+   - "Give me a summary of all the certificate amendments in 2023" (aggregate summary)
+   - "List all the projects that received certificates last year" (enumeration/counting)
+   - "How many EAC documents mention salmon?" (counting mentions)
+   These should SEARCH the database but only return an AI SUMMARY answer - NOT the document chunks.
+   The user wants a summary/count answer, not to browse through individual documents.
+
+4. **BROAD CATEGORY SEARCH** queries are asking about a CATEGORY of projects without specifying a particular one:
    - "Mining projects in BC" (wants a list of mining projects)
    - "LNG projects" (wants a list of LNG projects)
    - "What pipeline projects are there?" (wants a list of pipeline projects)
@@ -331,10 +342,16 @@ IRRELEVANT queries are clearly about:
 IMPORTANT: When in doubt about relevance, err on the side of RELEVANT.
 When in doubt about query_type between generic and specific, choose "specific_search" or "ambiguous".
 
-For generic_informational queries, recommend "return_generic_response".
-For broad_category_search queries, recommend "return_category_list" and set category_filter appropriately.
-For specific_search or ambiguous queries, recommend "proceed_with_search".
-For IRRELEVANT queries, recommend "inform_user_out_of_scope"."""
+**RECOMMENDATION MAPPING:**
+- For generic_informational queries → recommend "return_generic_response"
+- For broad_category_search queries → recommend "return_category_list" and set category_filter appropriately
+- For specific_search or ambiguous queries → recommend "proceed_with_search" (will return chunks)
+- For aggregation_summary queries → recommend "proceed_with_aggregation" (AI summary only, no chunks)
+- For IRRELEVANT queries → recommend "inform_user_out_of_scope"
+
+**KEY DISTINCTION between specific_search and aggregation_summary:**
+- specific_search: User wants to SEE the actual document content (e.g., "What does the Schedule B say about...")
+- aggregation_summary: User wants a COUNT or SUMMARY answer (e.g., "How many certificates...", "What percentage...")"""
 
         if context:
             prompt += f"\n\nAdditional context: {context}"
@@ -389,10 +406,22 @@ For IRRELEVANT queries, recommend "inform_user_out_of_scope"."""
             "indigenous", "first nations", "permit", "monitoring"
         ]
 
-        # Specific project/search indicators
+        # Specific project/search indicators (user wants to SEE document content)
         specific_indicators = [
             "for the", "about the", "from the", "schedule b for", "schedule a for",
-            "letters from", "documents for", "conditions for", "certificate for"
+            "letters from", "documents for", "conditions for", "certificate for",
+            "does the", "what does", "show me the", "find the", "refers to", "mention"
+        ]
+
+        # Aggregation/summary query patterns (user wants counts, statistics, summaries)
+        aggregation_patterns = [
+            "how many", "how much", "what percentage", "what percent",
+            "count of", "total number", "number of", "list all",
+            "summary of", "overview of", "statistics", "were given",
+            "were issued", "were approved", "were rejected", "were completed",
+            "in 2024", "in 2023", "in 2022", "in 2021", "in 2020",
+            "last year", "this year", "per year", "annually",
+            "across all", "all the", "total", "overall"
         ]
 
         # Clear non-EAO terms
@@ -411,6 +440,9 @@ For IRRELEVANT queries, recommend "inform_user_out_of_scope"."""
 
         # Check for generic informational patterns
         is_generic = any(pattern in query_lower for pattern in generic_patterns)
+
+        # Check for aggregation/summary patterns
+        is_aggregation = any(pattern in query_lower for pattern in aggregation_patterns)
 
         # Check for specific search indicators
         has_specific_indicators = any(indicator in query_lower for indicator in specific_indicators)
@@ -443,7 +475,7 @@ For IRRELEVANT queries, recommend "inform_user_out_of_scope"."""
             suggested_response = None
             generic_response = None
             category_filter = detected_category
-        elif is_generic and not has_specific_indicators:
+        elif is_generic and not has_specific_indicators and not is_aggregation:
             # Generic informational query about EAO
             is_relevant = True
             query_type = "generic_informational"
@@ -452,6 +484,16 @@ For IRRELEVANT queries, recommend "inform_user_out_of_scope"."""
             recommendation = "return_generic_response"
             suggested_response = None
             generic_response = self._get_fallback_generic_response(query)
+            category_filter = None
+        elif is_aggregation and not has_specific_indicators:
+            # Aggregation/summary query - wants counts or summaries, not specific document content
+            is_relevant = True
+            query_type = "aggregation_summary"
+            confidence = 0.85
+            reasoning = ["Aggregation/summary query detected", "Query asks for counts, statistics, or summaries across documents"]
+            recommendation = "proceed_with_aggregation"
+            suggested_response = None
+            generic_response = None
             category_filter = None
         elif has_specific_indicators or (rag_matches > 0 and has_capital_letters):
             # Specific search query
