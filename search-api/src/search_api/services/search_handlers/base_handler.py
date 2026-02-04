@@ -205,38 +205,46 @@ class BaseSearchHandler(ABC):
         }
     
     @classmethod
-    def _generate_agentic_summary(cls, documents_or_chunks: List, query: str, 
-                                 metrics: Dict) -> Dict[str, Any]:
+    def _generate_agentic_summary(cls, documents_or_chunks: List, query: str,
+                                 metrics: Dict, project_metadata: Dict = None) -> Dict[str, Any]:
         """Generate summary using LLM summarizer from generation package.
-        
+
         Args:
             documents_or_chunks (list): Retrieved documents or document chunks
             query (str): The original search query
             metrics (dict): Metrics dictionary to update
-            
+            project_metadata (dict): Optional project metadata including description, status, etc.
+
         Returns:
             dict: Summary result containing response text or error info
         """
         current_app.logger.info("=== AGENTIC SUMMARY: Starting LLM summarizer from generation package ===")
-        
+
         llm_start = time.time()
         current_app.logger.info(f"Using LLM summarizer for summary: {query}")
         current_app.logger.info(f"Number of documents/chunks for summary: {len(documents_or_chunks) if documents_or_chunks else 0}")
-        
+        if project_metadata:
+            current_app.logger.info(f"🤖 LLM: Project metadata provided for summary context: {list(project_metadata.keys())}")
+
         try:
             from search_api.services.generation.factories import SummarizerFactory
-            
+
             summarizer = SummarizerFactory.create_summarizer()
-            
+
+            # Build search context with project metadata if available
+            search_context = {
+                "context": "Agentic search summary",
+                "search_strategy": "agentic",
+                "total_documents": len(documents_or_chunks)
+            }
+            if project_metadata:
+                search_context["project_metadata"] = project_metadata
+
             current_app.logger.info("🤖 LLM: Generating summary using LLM summarizer...")
             summary_result = summarizer.summarize_search_results(
                 query=query,
                 documents_or_chunks=documents_or_chunks,
-                search_context={
-                    "context": "Agentic search summary",
-                    "search_strategy": "agentic",
-                    "total_documents": len(documents_or_chunks)
-                }
+                search_context=search_context
             )
             
             summary_text = summary_result['summary']

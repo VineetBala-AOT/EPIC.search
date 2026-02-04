@@ -22,29 +22,37 @@ class OpenAISummarizer(Summarizer):
         self.max_context_length = getattr(current_app.config, 'LLM_MAX_CONTEXT_LENGTH', 8192)
     
     def summarize_search_results(
-        self, 
-        query: str, 
+        self,
+        query: str,
         documents_or_chunks: List[Dict[str, Any]],
         search_context: Optional[Dict] = None
     ) -> Dict[str, Any]:
         """Summarize search results using OpenAI.
-        
+
         Args:
             query: Original search query
             documents_or_chunks: List of document/chunk dictionaries
-            search_context: Additional context about the search
-            
+            search_context: Additional context about the search (may include project_metadata)
+
         Returns:
             Dict containing summarization result
         """
         try:
             logger.info(f"Summarizing {len(documents_or_chunks)} documents/chunks using OpenAI")
-            
+
+            # Build context string including project metadata if available
+            context = search_context.get('context') if search_context else None
+            project_metadata = search_context.get('project_metadata') if search_context else None
+
+            if project_metadata:
+                logger.info(f"Project metadata available for summary: {project_metadata.get('project_name', 'unknown')}")
+
             # Use the existing summarize_documents method
             summary_text = self.summarize_documents(
                 documents=documents_or_chunks,
                 query=query,
-                context=search_context.get('context') if search_context else None
+                context=context,
+                project_metadata=project_metadata
             )
             
             return {
@@ -71,31 +79,33 @@ class OpenAISummarizer(Summarizer):
         self,
         documents: List[Dict[str, Any]],
         query: str,
-        context: Optional[str] = None
+        context: Optional[str] = None,
+        project_metadata: Optional[Dict] = None
     ) -> str:
         """Summarize a list of documents in relation to a query using OpenAI.
-        
+
         Args:
             documents: List of document dictionaries with content and metadata.
             query: The original search query for context.
             context: Optional additional context for summarization.
-            
+            project_metadata: Optional project metadata (description, status, etc.)
+
         Returns:
             str: A comprehensive summary of the documents.
-            
+
         Raises:
             Exception: If summarization fails.
         """
         try:
             if not documents:
                 return "No documents found to summarize."
-            
-            # Build the summarization prompt
-            prompt = self._build_summarization_prompt(query, context)
-            
+
+            # Build the summarization prompt with project metadata
+            prompt = self._build_summarization_prompt(query, context, project_metadata)
+
             # Prepare document content
             doc_content = self._prepare_document_content(documents)
-            
+
             messages = [
                 {"role": "system", "content": prompt},
                 {
@@ -167,20 +177,51 @@ class OpenAISummarizer(Summarizer):
             # Return the summary as fallback
             return f"Based on the available documents, here's what I found:\n\n{summary}"
     
-    def _build_summarization_prompt(self, query: str, context: Optional[str] = None) -> str:
+    def _build_summarization_prompt(self, query: str, context: Optional[str] = None,
+                                    project_metadata: Optional[Dict] = None) -> str:
         """Build a summarization prompt tailored for EAO content."""
+
+        # Build project context section if metadata is available
+        project_context = ""
+        if project_metadata:
+            project_parts = []
+            if project_metadata.get("project_name"):
+                project_parts.append(f"**Project Name:** {project_metadata['project_name']}")
+            if project_metadata.get("description"):
+                project_parts.append(f"**Project Description:** {project_metadata['description']}")
+            if project_metadata.get("status"):
+                project_parts.append(f"**Current Status/Phase:** {project_metadata['status']}")
+            if project_metadata.get("type"):
+                project_parts.append(f"**Project Type:** {project_metadata['type']}")
+            if project_metadata.get("proponent"):
+                project_parts.append(f"**Proponent:** {project_metadata['proponent']}")
+            if project_metadata.get("region"):
+                project_parts.append(f"**Region:** {project_metadata['region']}")
+            if project_metadata.get("location"):
+                project_parts.append(f"**Location:** {project_metadata['location']}")
+            if project_metadata.get("ea_decision"):
+                project_parts.append(f"**EA Decision:** {project_metadata['ea_decision']}")
+            if project_metadata.get("decision_date"):
+                project_parts.append(f"**Decision Date:** {project_metadata['decision_date']}")
+
+            if project_parts:
+                project_context = "\n\n**PROJECT INFORMATION (use this to provide accurate context in your summary):**\n" + "\n".join(project_parts)
+
         prompt = f"""
-You are an expert analyst specializing in Environmental Assessment Office (EAO) reports and regulatory documentation. 
+You are an expert analyst specializing in Environmental Assessment Office (EAO) reports and regulatory documentation.
 Your task is to create a concise summary of the provided documents that directly addresses the user's query.
+{project_context}
 
 Key instructions:
 1. Focus only on information relevant to the query: "{query}"
-2. Highlight regulatory considerations, project implications, and critical findings
-3. Provide a short summary in 2-3 paragraphs maximum
-4. Use professional, clear language suitable for stakeholders and project reviewers
-5. Include references to document types, sections, or dates if critical
-6. Avoid lengthy legal or technical excerpts; summarize the essence
-7. Emphasize insights, decisions, or compliance-related points
+2. If the user asks about the project itself (e.g., "what is X project about", "tell me about X"), use the project information above to provide an accurate overview along with document findings
+3. If the user asks about the project status or phase, use the Current Status/Phase from the project information above
+4. Highlight regulatory considerations, project implications, and critical findings
+5. Provide a short summary in 2-3 paragraphs maximum
+6. Use professional, clear language suitable for stakeholders and project reviewers
+7. Include references to document types, sections, or dates if critical
+8. Avoid lengthy legal or technical excerpts; summarize the essence
+9. Emphasize insights, decisions, or compliance-related points
 
 {f"Additional context: {context}" if context else ""}
 

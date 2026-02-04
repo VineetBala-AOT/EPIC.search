@@ -134,10 +134,11 @@ class AIHandler(BaseSearchHandler):
         
         # LLM parameter extraction
         current_app.logger.info("🤖 AI MODE: Starting parameter extraction...")
+        available_projects = []  # Initialize early so it's accessible for summary generation
         try:
             from search_api.services.generation.factories import ParameterExtractorFactory
             from search_api.clients.vector_search_client import VectorSearchClient
-            
+
             agentic_start = time.time()
             current_app.logger.info("🤖 LLM: Starting parameter extraction from generation package...")
             
@@ -329,9 +330,37 @@ class AIHandler(BaseSearchHandler):
                 }
             }
         
+        # Build project metadata context for the summary
+        # This provides project description, status, and other info to the LLM
+        matched_project_metadata = None
+        try:
+            if project_ids and available_projects:
+                matched_projects_meta = []
+                for proj in available_projects:
+                    if proj.get("project_id") in project_ids:
+                        proj_meta = proj.get("project_metadata", {})
+                        if proj_meta:
+                            matched_projects_meta.append({
+                                "project_name": proj.get("project_name", ""),
+                                "project_id": proj.get("project_id", ""),
+                                "description": proj_meta.get("description", ""),
+                                "status": proj_meta.get("currentPhase", {}).get("name", "") if isinstance(proj_meta.get("currentPhase"), dict) else str(proj_meta.get("currentPhase", "")),
+                                "region": proj_meta.get("region", ""),
+                                "type": proj_meta.get("type", ""),
+                                "proponent": proj_meta.get("proponentName", proj_meta.get("proponent", {}).get("name", "")) if isinstance(proj_meta.get("proponent"), dict) else str(proj_meta.get("proponentName", proj_meta.get("proponent", ""))),
+                                "location": proj_meta.get("location", ""),
+                                "ea_decision": proj_meta.get("eaDecision", ""),
+                                "decision_date": proj_meta.get("decisionDate", ""),
+                            })
+                if matched_projects_meta:
+                    matched_project_metadata = matched_projects_meta[0] if len(matched_projects_meta) == 1 else {"projects": matched_projects_meta}
+                    current_app.logger.info(f"🔍 AI MODE: Found project metadata for summary: {matched_project_metadata.get('project_name', 'multiple')}")
+        except Exception as e:
+            current_app.logger.warning(f"🔍 AI MODE: Could not extract project metadata for summary: {e}")
+
         # Generate AI summary of search results
         current_app.logger.info("🔍 AI MODE: Generating AI summary...")
-        summary_result = cls._generate_agentic_summary(search_result["documents_or_chunks"], query, metrics)
+        summary_result = cls._generate_agentic_summary(search_result["documents_or_chunks"], query, metrics, project_metadata=matched_project_metadata)
         
         # Handle summary generation errors
         if isinstance(summary_result, dict) and "error" in summary_result:
