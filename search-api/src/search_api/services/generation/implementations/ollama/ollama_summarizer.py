@@ -102,19 +102,31 @@ class OllamaSummarizer(Summarizer):
 
             # Build the summarization prompt with project metadata
             prompt = self._build_summarization_prompt(query, context, project_metadata)
-            
+
             # Prepare document content (with more aggressive truncation for Ollama)
             doc_content = self._prepare_document_content(documents)
-            
+
+            # Log metadata availability for debugging
+            is_project_query = self._is_project_level_query(query) if project_metadata else False
+            logger.info(f"Summarizer received project_metadata: {project_metadata is not None}, is_project_level_query: {is_project_query}")
+            if project_metadata:
+                logger.info(f"Project metadata keys: {list(project_metadata.keys())}, status='{project_metadata.get('status', '')}', description='{str(project_metadata.get('description', ''))[:80]}...'")
+
+            # Build user message - include project metadata directly when available
+            # for project-level queries so the LLM uses it as primary source
+            user_content = f"Query: {query}\n\n"
+
+            if project_metadata and is_project_query:
+                # For project-level queries, present metadata as primary info
+                user_content += "IMPORTANT: Use the following verified project information to answer the query accurately.\n\n"
+                user_content += self._format_project_metadata_for_message(project_metadata)
+                user_content += f"\n\nSupporting documents from the project:\n{doc_content}"
+            else:
+                user_content += f"Summarize the key regulatory findings, project implications, and compliance notes from these documents:\n{doc_content}"
+
             messages = [
                 {"role": "system", "content": prompt},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Query: {query}\n\n"
-                        f"Summarize the key regulatory findings, project implications, and compliance notes from these documents:\n{doc_content}"
-                    )
-                }
+                {"role": "user", "content": user_content}
             ]
             
             logger.info(f"Summarizing {len(documents)} documents using Ollama")
@@ -177,6 +189,41 @@ class OllamaSummarizer(Summarizer):
             # Return the summary as fallback
             return f"Based on the available documents, here's what I found:\n\n{summary}"
     
+    def _is_project_level_query(self, query: str) -> bool:
+        """Check if the query is asking about the project itself (overview, status, etc.)."""
+        query_lower = query.lower()
+        project_level_indicators = [
+            "what is", "tell me about", "describe", "overview of", "summary of",
+            "about the", "all about", "information on", "details of", "details about",
+            "current status", "what status", "project status", "phase of",
+            "current phase", "what phase", "who is the proponent", "proponent of",
+            "where is", "location of", "what type", "type of project",
+            "what region", "decision on", "ea decision", "eac decision",
+            "when was", "decision date", "who owns", "who operates",
+        ]
+        return any(indicator in query_lower for indicator in project_level_indicators)
+
+    def _format_project_metadata_for_message(self, project_metadata: Dict) -> str:
+        """Format project metadata as a clear, structured block for the user message."""
+        parts = ["--- VERIFIED PROJECT DATA (from official registry) ---"]
+        field_map = [
+            ("project_name", "Project Name"),
+            ("description", "Description"),
+            ("status", "Current Status/Phase"),
+            ("type", "Project Type"),
+            ("proponent", "Proponent"),
+            ("region", "Region"),
+            ("location", "Location"),
+            ("ea_decision", "EA Decision"),
+            ("decision_date", "Decision Date"),
+        ]
+        for key, label in field_map:
+            value = project_metadata.get(key, "")
+            if value:
+                parts.append(f"{label}: {value}")
+        parts.append("--- END PROJECT DATA ---")
+        return "\n".join(parts)
+
     def _build_summarization_prompt(self, query: str, context: Optional[str] = None,
                                     project_metadata: Optional[Dict] = None) -> str:
         """Build a summarization prompt tailored for EAO content."""
@@ -208,19 +255,21 @@ class OllamaSummarizer(Summarizer):
                 project_context = "\n\n**PROJECT INFORMATION (use this to provide accurate context in your summary):**\n" + "\n".join(project_parts)
 
         prompt = f"""You are an expert analyst specializing in Environmental Assessment Office (EAO) reports and regulatory documentation.
-Your task is to create a concise summary of the provided documents that directly addresses the user's query.
+Your task is to create a concise summary that directly addresses the user's query.
 {project_context}
 
-Key instructions:
+CRITICAL RULES:
+- When the user message contains "VERIFIED PROJECT DATA", you MUST use that data as your PRIMARY and AUTHORITATIVE source for project details (name, description, status, proponent, location, type, EA decision, decision date).
+- DO NOT contradict or ignore the verified project data. State the facts from it directly.
+- Use information from the documents only to SUPPLEMENT the verified project data, not to override it.
+- If the query asks about project status, phase, or overview, your answer MUST reflect the verified project data.
+
+Additional guidelines:
 1. Focus only on information relevant to the query: "{query}"
-2. If the user asks about the project itself (e.g., "what is X project about", "tell me about X"), use the project information above to provide an accurate overview along with document findings
-3. If the user asks about the project status or phase, use the Current Status/Phase from the project information above
+2. Provide a short summary in 2-3 paragraphs maximum
+3. Use professional, clear language suitable for stakeholders and project reviewers
 4. Highlight regulatory considerations, project implications, and critical findings
-5. Provide a short summary in 2-3 paragraphs maximum
-6. Use professional, clear language suitable for stakeholders and project reviewers
-7. Include references to document types, sections, or dates if critical
-8. Avoid lengthy legal or technical excerpts; summarize the essence
-9. Emphasize insights, decisions, or compliance-related points
+5. Avoid lengthy legal or technical excerpts; summarize the essence
 
 {f"Additional context: {context}" if context else ""}
 
