@@ -340,23 +340,63 @@ class AIHandler(BaseSearchHandler):
                     if proj.get("project_id") in project_ids:
                         proj_meta = proj.get("project_metadata", {})
                         if proj_meta:
+                            # Extract status from currentPhaseName (dict with 'name') or fallback to 'status' field
+                            status = ""
+                            current_phase = proj_meta.get("currentPhaseName") or proj_meta.get("currentPhase")
+                            if isinstance(current_phase, dict):
+                                status = current_phase.get("name", "")
+                            elif current_phase:
+                                status = str(current_phase)
+                            if not status:
+                                status = proj_meta.get("status", "")
+
+                            # Extract proponent name from nested dict or string
+                            proponent = ""
+                            proponent_data = proj_meta.get("proponent")
+                            if isinstance(proponent_data, dict):
+                                proponent = proponent_data.get("name", proponent_data.get("company", ""))
+                            elif proponent_data:
+                                proponent = str(proponent_data)
+                            if not proponent:
+                                proponent = proj_meta.get("proponentName", "")
+
+                            # Extract EA decision from nested dict or string
+                            ea_decision = ""
+                            ea_decision_data = proj_meta.get("eacDecision") or proj_meta.get("eaDecision")
+                            if isinstance(ea_decision_data, dict):
+                                ea_decision = ea_decision_data.get("name", "")
+                            elif ea_decision_data:
+                                ea_decision = str(ea_decision_data)
+
+                            # Format decision date (strip time portion if present)
+                            decision_date = proj_meta.get("decisionDate", "")
+                            if decision_date and "T" in str(decision_date):
+                                decision_date = str(decision_date).split("T")[0]
+
                             matched_projects_meta.append({
-                                "project_name": proj.get("project_name", ""),
+                                "project_name": proj.get("project_name", "") or proj_meta.get("name", ""),
                                 "project_id": proj.get("project_id", ""),
                                 "description": proj_meta.get("description", ""),
-                                "status": proj_meta.get("currentPhase", {}).get("name", "") if isinstance(proj_meta.get("currentPhase"), dict) else str(proj_meta.get("currentPhase", "")),
+                                "status": status,
                                 "region": proj_meta.get("region", ""),
                                 "type": proj_meta.get("type", ""),
-                                "proponent": proj_meta.get("proponentName", proj_meta.get("proponent", {}).get("name", "")) if isinstance(proj_meta.get("proponent"), dict) else str(proj_meta.get("proponentName", proj_meta.get("proponent", ""))),
+                                "proponent": proponent,
                                 "location": proj_meta.get("location", ""),
-                                "ea_decision": proj_meta.get("eaDecision", ""),
-                                "decision_date": proj_meta.get("decisionDate", ""),
+                                "ea_decision": ea_decision,
+                                "decision_date": decision_date,
                             })
                 if matched_projects_meta:
                     matched_project_metadata = matched_projects_meta[0] if len(matched_projects_meta) == 1 else {"projects": matched_projects_meta}
                     current_app.logger.info(f"🔍 AI MODE: Found project metadata for summary: {matched_project_metadata.get('project_name', 'multiple')}")
+                    current_app.logger.info(f"🔍 AI MODE: Project metadata details - description: '{str(matched_project_metadata.get('description', ''))[:100]}...', status: '{matched_project_metadata.get('status', '')}', ea_decision: '{matched_project_metadata.get('ea_decision', '')}'")
+                else:
+                    current_app.logger.info(f"🔍 AI MODE: No matching project metadata found. project_ids={project_ids}, available_projects count={len(available_projects)}")
+            else:
+                current_app.logger.info(f"🔍 AI MODE: Skipping project metadata - project_ids={project_ids}, available_projects={'present' if available_projects else 'empty'}")
         except Exception as e:
             current_app.logger.warning(f"🔍 AI MODE: Could not extract project metadata for summary: {e}")
+            import traceback
+            current_app.logger.warning(f"🔍 AI MODE: Metadata extraction traceback: {traceback.format_exc()}")
 
         # Generate AI summary of search results
         current_app.logger.info("🔍 AI MODE: Generating AI summary...")
