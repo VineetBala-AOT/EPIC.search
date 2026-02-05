@@ -91,9 +91,17 @@ class ToolsService:
             
             # Process the results
             projects_list = []
-            
+
             for row in results:
                 project_id, project_name, project_metadata = row
+                # Log sample metadata structure for debugging
+                if project_metadata and project_name and "brucejack" in project_name.lower():
+                    meta_type = type(project_metadata).__name__
+                    meta_keys = list(project_metadata.keys()) if isinstance(project_metadata, dict) else "NOT_A_DICT"
+                    has_desc = bool(project_metadata.get("description")) if isinstance(project_metadata, dict) else False
+                    has_status = bool(project_metadata.get("status")) if isinstance(project_metadata, dict) else False
+                    has_phase = bool(project_metadata.get("currentPhaseName")) if isinstance(project_metadata, dict) else False
+                    logging.info(f"PROJECT METADATA DEBUG [{project_name}]: type={meta_type}, keys_sample={str(meta_keys)[:200]}, has_description={has_desc}, has_status={has_status}, has_currentPhaseName={has_phase}")
                 projects_list.append({
                     "project_id": project_id,
                     "project_name": project_name,

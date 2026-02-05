@@ -335,11 +335,29 @@ class AIHandler(BaseSearchHandler):
         matched_project_metadata = None
         try:
             if project_ids and available_projects:
+                current_app.logger.info(f"🔍 AI MODE: Looking for project_ids {project_ids} in {len(available_projects)} available projects")
                 matched_projects_meta = []
                 for proj in available_projects:
                     if proj.get("project_id") in project_ids:
                         proj_meta = proj.get("project_metadata", {})
+                        proj_meta_type = type(proj_meta).__name__
+                        current_app.logger.info(f"🔍 AI MODE: Matched project '{proj.get('project_name')}' (id={proj.get('project_id')}), project_metadata type={proj_meta_type}, truthy={bool(proj_meta)}")
+                        if isinstance(proj_meta, str):
+                            # Handle case where metadata is a JSON string instead of dict
+                            import json as json_module
+                            try:
+                                proj_meta = json_module.loads(proj_meta)
+                                current_app.logger.info(f"🔍 AI MODE: Parsed project_metadata from string to dict")
+                            except Exception as parse_err:
+                                current_app.logger.error(f"🔍 AI MODE: Failed to parse project_metadata string: {parse_err}")
+                                proj_meta = {}
                         if proj_meta:
+                            # Log raw metadata keys for debugging
+                            if isinstance(proj_meta, dict):
+                                current_app.logger.info(f"🔍 AI MODE: Raw metadata keys: {list(proj_meta.keys())[:15]}")
+                                current_app.logger.info(f"🔍 AI MODE: Raw description: '{str(proj_meta.get('description', ''))[:100]}'")
+                                current_app.logger.info(f"🔍 AI MODE: Raw status: '{proj_meta.get('status', '')}'")
+                                current_app.logger.info(f"🔍 AI MODE: Raw currentPhaseName: '{proj_meta.get('currentPhaseName', '')}'")
                             # Extract status from currentPhaseName (dict with 'name') or fallback to 'status' field
                             status = ""
                             current_phase = proj_meta.get("currentPhaseName") or proj_meta.get("currentPhase")

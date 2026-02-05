@@ -294,6 +294,18 @@ class VectorSearchClient:
             projects = data.get('projects', [])
 
             if include_metadata:
+                # Log metadata presence for debugging
+                projects_with_meta = sum(1 for p in projects if p.get("project_metadata"))
+                current_app.logger.info(f"Projects list: {len(projects)} total, {projects_with_meta} have project_metadata")
+                # Log a sample project's metadata structure
+                for p in projects:
+                    if p.get("project_metadata") and "brucejack" in p.get("project_name", "").lower():
+                        meta = p["project_metadata"]
+                        meta_type = type(meta).__name__
+                        if isinstance(meta, dict):
+                            current_app.logger.info(f"METADATA RECEIVED [{p['project_name']}]: type={meta_type}, description_present={bool(meta.get('description'))}, status={meta.get('status', 'N/A')}, currentPhaseName={meta.get('currentPhaseName', 'N/A')}")
+                        else:
+                            current_app.logger.info(f"METADATA RECEIVED [{p['project_name']}]: type={meta_type}, value_preview={str(meta)[:200]}")
                 return projects  # full list including project_metadata
             else:
                 # Strip metadata if caller doesn't need it
