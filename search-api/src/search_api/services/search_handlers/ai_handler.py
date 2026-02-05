@@ -334,11 +334,23 @@ class AIHandler(BaseSearchHandler):
         # This provides project description, status, and other info to the LLM
         matched_project_metadata = None
         try:
-            if project_ids and available_projects:
-                current_app.logger.info(f"🔍 AI MODE: Looking for project_ids {project_ids} in {len(available_projects)} available projects")
+            # Determine which projects to look up metadata for
+            metadata_project_ids = project_ids
+
+            # Fallback: if no project_ids were extracted by LLM but query mentions a project,
+            # try direct text matching against available project names
+            if not metadata_project_ids and available_projects:
+                current_app.logger.info(f"🔍 AI MODE: No project_ids from LLM, trying direct name matching against query...")
+                matched_by_name = cls._match_project_by_query_text(query, available_projects)
+                if matched_by_name:
+                    metadata_project_ids = [matched_by_name]
+                    current_app.logger.info(f"🔍 AI MODE: Direct name match found project_id: {matched_by_name}")
+
+            if metadata_project_ids and available_projects:
+                current_app.logger.info(f"🔍 AI MODE: Looking for project_ids {metadata_project_ids} in {len(available_projects)} available projects")
                 matched_projects_meta = []
                 for proj in available_projects:
-                    if proj.get("project_id") in project_ids:
+                    if proj.get("project_id") in metadata_project_ids:
                         proj_meta = proj.get("project_metadata", {})
                         proj_meta_type = type(proj_meta).__name__
                         current_app.logger.info(f"🔍 AI MODE: Matched project '{proj.get('project_name')}' (id={proj.get('project_id')}), project_metadata type={proj_meta_type}, truthy={bool(proj_meta)}")
@@ -352,65 +364,17 @@ class AIHandler(BaseSearchHandler):
                                 current_app.logger.error(f"🔍 AI MODE: Failed to parse project_metadata string: {parse_err}")
                                 proj_meta = {}
                         if proj_meta:
-                            # Log raw metadata keys for debugging
-                            if isinstance(proj_meta, dict):
-                                current_app.logger.info(f"🔍 AI MODE: Raw metadata keys: {list(proj_meta.keys())[:15]}")
-                                current_app.logger.info(f"🔍 AI MODE: Raw description: '{str(proj_meta.get('description', ''))[:100]}'")
-                                current_app.logger.info(f"🔍 AI MODE: Raw status: '{proj_meta.get('status', '')}'")
-                                current_app.logger.info(f"🔍 AI MODE: Raw currentPhaseName: '{proj_meta.get('currentPhaseName', '')}'")
-                            # Extract status from currentPhaseName (dict with 'name') or fallback to 'status' field
-                            status = ""
-                            current_phase = proj_meta.get("currentPhaseName") or proj_meta.get("currentPhase")
-                            if isinstance(current_phase, dict):
-                                status = current_phase.get("name", "")
-                            elif current_phase:
-                                status = str(current_phase)
-                            if not status:
-                                status = proj_meta.get("status", "")
-
-                            # Extract proponent name from nested dict or string
-                            proponent = ""
-                            proponent_data = proj_meta.get("proponent")
-                            if isinstance(proponent_data, dict):
-                                proponent = proponent_data.get("name", proponent_data.get("company", ""))
-                            elif proponent_data:
-                                proponent = str(proponent_data)
-                            if not proponent:
-                                proponent = proj_meta.get("proponentName", "")
-
-                            # Extract EA decision from nested dict or string
-                            ea_decision = ""
-                            ea_decision_data = proj_meta.get("eacDecision") or proj_meta.get("eaDecision")
-                            if isinstance(ea_decision_data, dict):
-                                ea_decision = ea_decision_data.get("name", "")
-                            elif ea_decision_data:
-                                ea_decision = str(ea_decision_data)
-
-                            # Format decision date (strip time portion if present)
-                            decision_date = proj_meta.get("decisionDate", "")
-                            if decision_date and "T" in str(decision_date):
-                                decision_date = str(decision_date).split("T")[0]
-
-                            matched_projects_meta.append({
-                                "project_name": proj.get("project_name", "") or proj_meta.get("name", ""),
-                                "project_id": proj.get("project_id", ""),
-                                "description": proj_meta.get("description", ""),
-                                "status": status,
-                                "region": proj_meta.get("region", ""),
-                                "type": proj_meta.get("type", ""),
-                                "proponent": proponent,
-                                "location": proj_meta.get("location", ""),
-                                "ea_decision": ea_decision,
-                                "decision_date": decision_date,
-                            })
+                            extracted = cls._extract_metadata_fields(proj, proj_meta)
+                            if extracted:
+                                matched_projects_meta.append(extracted)
                 if matched_projects_meta:
                     matched_project_metadata = matched_projects_meta[0] if len(matched_projects_meta) == 1 else {"projects": matched_projects_meta}
                     current_app.logger.info(f"🔍 AI MODE: Found project metadata for summary: {matched_project_metadata.get('project_name', 'multiple')}")
                     current_app.logger.info(f"🔍 AI MODE: Project metadata details - description: '{str(matched_project_metadata.get('description', ''))[:100]}...', status: '{matched_project_metadata.get('status', '')}', ea_decision: '{matched_project_metadata.get('ea_decision', '')}'")
                 else:
-                    current_app.logger.info(f"🔍 AI MODE: No matching project metadata found. project_ids={project_ids}, available_projects count={len(available_projects)}")
+                    current_app.logger.info(f"🔍 AI MODE: No matching project metadata found. project_ids={metadata_project_ids}, available_projects count={len(available_projects)}")
             else:
-                current_app.logger.info(f"🔍 AI MODE: Skipping project metadata - project_ids={project_ids}, available_projects={'present' if available_projects else 'empty'}")
+                current_app.logger.info(f"🔍 AI MODE: Skipping project metadata - project_ids={metadata_project_ids}, available_projects={'present' if available_projects else 'empty'}")
         except Exception as e:
             current_app.logger.warning(f"🔍 AI MODE: Could not extract project metadata for summary: {e}")
             import traceback
@@ -671,3 +635,141 @@ For example, you could ask:
 - "What letters are there about [project name]?"""
 
         return response
+
+    @classmethod
+    def _match_project_by_query_text(cls, query: str, available_projects: List[Dict]) -> Optional[str]:
+        """Match a project by directly comparing query text against project names.
+
+        This is a fallback when LLM parameter extraction doesn't return project_ids.
+        Uses simple word-based matching to find the most likely project.
+
+        Args:
+            query: The user's query text
+            available_projects: List of project dicts with project_id and project_name
+
+        Returns:
+            The project_id of the best matching project, or None
+        """
+        query_lower = query.lower()
+        # Common words to ignore when matching
+        generic_words = {
+            'project', 'mine', 'gold', 'the', 'of', 'and', 'a', 'in', 'is', 'what',
+            'tell', 'me', 'about', 'for', 'current', 'status', 'describe', 'overview',
+            'show', 'get', 'find', 'search', 'all', 'documents', 'document', 'type',
+            'schedule', 'certificate', 'letter', 'report', 'how', 'many', 'where',
+            'who', 'when', 'which', 'does', 'do', 'are', 'there', 'can', 'you',
+            'phase', 'decision', 'proponent', 'region', 'location'
+        }
+
+        best_match_id = None
+        best_score = 0.0
+
+        for proj in available_projects:
+            proj_name = proj.get("project_name", "")
+            if not proj_name:
+                continue
+            proj_name_lower = proj_name.lower()
+
+            # Split project name into words
+            proj_words = set(proj_name_lower.split())
+            distinctive_words = proj_words - generic_words
+
+            if not distinctive_words:
+                distinctive_words = proj_words
+
+            # Count how many distinctive project words appear in the query
+            matches = sum(1 for w in distinctive_words if w in query_lower)
+
+            if not distinctive_words:
+                continue
+
+            score = matches / len(distinctive_words)
+
+            # Require at least one distinctive word match with minimum 50% coverage
+            if matches >= 1 and score > best_score and score >= 0.5:
+                best_score = score
+                best_match_id = proj.get("project_id")
+                current_app.logger.info(f"🔍 AI MODE: Name match candidate: '{proj_name}' score={score:.2f} (matched {matches}/{len(distinctive_words)} distinctive words)")
+
+        return best_match_id
+
+    @classmethod
+    def _extract_metadata_fields(cls, proj: Dict, proj_meta: Dict) -> Optional[Dict]:
+        """Extract structured metadata fields from raw project metadata.
+
+        Handles nested dicts, type variations, and date formatting for
+        fields like currentPhaseName, proponent, eacDecision, etc.
+
+        Args:
+            proj: The project dict with project_id and project_name
+            proj_meta: The raw project_metadata dict from the database
+
+        Returns:
+            Dict with extracted fields, or None if extraction fails
+        """
+        try:
+            # Log raw metadata keys for debugging
+            if isinstance(proj_meta, dict):
+                current_app.logger.info(f"🔍 AI MODE: Raw metadata keys: {list(proj_meta.keys())[:15]}")
+                current_app.logger.info(f"🔍 AI MODE: Raw description: '{str(proj_meta.get('description', ''))[:100]}'")
+                current_app.logger.info(f"🔍 AI MODE: Raw status: '{proj_meta.get('status', '')}'")
+                current_app.logger.info(f"🔍 AI MODE: Raw currentPhaseName: '{proj_meta.get('currentPhaseName', '')}'")
+
+            # Extract status from currentPhaseName (dict with 'name') or fallback to 'status' field
+            status = ""
+            current_phase = proj_meta.get("currentPhaseName") or proj_meta.get("currentPhase")
+            if isinstance(current_phase, dict):
+                status = current_phase.get("name", "")
+            elif current_phase:
+                status = str(current_phase)
+            if not status:
+                status = proj_meta.get("status", "")
+
+            # Extract proponent name from nested dict or string
+            proponent = ""
+            proponent_data = proj_meta.get("proponent")
+            if isinstance(proponent_data, dict):
+                proponent = proponent_data.get("name", proponent_data.get("company", ""))
+            elif proponent_data:
+                proponent = str(proponent_data)
+            if not proponent:
+                proponent = proj_meta.get("proponentName", "")
+
+            # Extract EA decision from nested dict or string
+            ea_decision = ""
+            ea_decision_data = proj_meta.get("eacDecision") or proj_meta.get("eaDecision")
+            if isinstance(ea_decision_data, dict):
+                ea_decision = ea_decision_data.get("name", "")
+            elif ea_decision_data:
+                ea_decision = str(ea_decision_data)
+
+            # Format decision date (strip time portion if present)
+            decision_date = proj_meta.get("decisionDate", "")
+            if decision_date and "T" in str(decision_date):
+                decision_date = str(decision_date).split("T")[0]
+
+            result = {
+                "project_name": proj.get("project_name", "") or proj_meta.get("name", ""),
+                "project_id": proj.get("project_id", ""),
+                "description": proj_meta.get("description", ""),
+                "status": status,
+                "region": proj_meta.get("region", ""),
+                "type": proj_meta.get("type", ""),
+                "proponent": proponent,
+                "location": proj_meta.get("location", ""),
+                "ea_decision": ea_decision,
+                "decision_date": decision_date,
+            }
+
+            # Verify we have at least some useful data
+            has_useful_data = any([result["description"], result["status"], result["proponent"], result["ea_decision"]])
+            if has_useful_data:
+                current_app.logger.info(f"🔍 AI MODE: Extracted metadata - description present: {bool(result['description'])}, status: '{result['status']}', proponent: '{result['proponent']}'")
+            else:
+                current_app.logger.warning(f"🔍 AI MODE: Metadata extracted but all key fields are empty for project '{result['project_name']}'")
+
+            return result
+
+        except Exception as e:
+            current_app.logger.warning(f"🔍 AI MODE: Failed to extract metadata fields: {e}")
+            return None

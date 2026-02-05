@@ -114,22 +114,36 @@ class OllamaSummarizer(Summarizer):
 
             # Build user message - include project metadata directly when available
             # for project-level queries so the LLM uses it as primary source
-            user_content = f"Query: {query}\n\n"
-
             if project_metadata and is_project_query:
-                # For project-level queries, present metadata as primary info
-                user_content += "IMPORTANT: Use the following verified project information to answer the query accurately.\n\n"
-                user_content += self._format_project_metadata_for_message(project_metadata)
-                user_content += f"\n\nSupporting documents from the project:\n{doc_content}"
+                # For project-level queries, put verified data FIRST and minimize document content
+                # This ensures the LLM prioritizes the official metadata
+                formatted_metadata = self._format_project_metadata_for_message(project_metadata)
+
+                # Limit document content to avoid overwhelming the metadata (Ollama has smaller context)
+                limited_doc_content = doc_content[:1000] if doc_content else ""
+
+                user_content = f"""Query: {query}
+
+YOU MUST ANSWER THIS QUERY USING THE VERIFIED PROJECT DATA BELOW AS YOUR PRIMARY SOURCE.
+State the facts from the verified data directly in your response.
+
+{formatted_metadata}
+
+Additional context from project documents (use only to supplement, NOT to override the verified data above):
+{limited_doc_content}"""
+
+                logger.info(f"PROJECT-LEVEL QUERY: Using verified metadata as primary source. Metadata formatted length: {len(formatted_metadata)}")
             else:
-                user_content += f"Summarize the key regulatory findings, project implications, and compliance notes from these documents:\n{doc_content}"
+                user_content = f"Query: {query}\n\nSummarize the key regulatory findings, project implications, and compliance notes from these documents:\n{doc_content}"
 
             messages = [
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": user_content}
             ]
-            
+
+            # Log the final user content for debugging (truncated)
             logger.info(f"Summarizing {len(documents)} documents using Ollama")
+            logger.info(f"User content preview (first 500 chars): {user_content[:500]}")
             response = self.client.chat_completion(
                 messages=messages,
                 temperature=self.temperature,
@@ -195,11 +209,12 @@ class OllamaSummarizer(Summarizer):
         project_level_indicators = [
             "what is", "tell me about", "describe", "overview of", "summary of",
             "about the", "all about", "information on", "details of", "details about",
-            "current status", "what status", "project status", "phase of",
+            "current status", "what status", "project status", "status of", "phase of",
             "current phase", "what phase", "who is the proponent", "proponent of",
-            "where is", "location of", "what type", "type of project",
-            "what region", "decision on", "ea decision", "eac decision",
+            "proponent for", "where is", "location of", "what type", "type of project",
+            "what region", "region of", "decision on", "ea decision", "eac decision",
             "when was", "decision date", "who owns", "who operates",
+            "description of", "description for",
         ]
         return any(indicator in query_lower for indicator in project_level_indicators)
 
@@ -258,11 +273,12 @@ class OllamaSummarizer(Summarizer):
 Your task is to create a concise summary that directly addresses the user's query.
 {project_context}
 
-CRITICAL RULES:
-- When the user message contains "VERIFIED PROJECT DATA", you MUST use that data as your PRIMARY and AUTHORITATIVE source for project details (name, description, status, proponent, location, type, EA decision, decision date).
-- DO NOT contradict or ignore the verified project data. State the facts from it directly.
-- Use information from the documents only to SUPPLEMENT the verified project data, not to override it.
-- If the query asks about project status, phase, or overview, your answer MUST reflect the verified project data.
+CRITICAL RULES (MUST FOLLOW):
+1. When the user message contains "VERIFIED PROJECT DATA", you MUST base your answer primarily on that data.
+2. For questions about project status, phase, description, proponent, location, type, or EA decision: COPY the relevant facts directly from the VERIFIED PROJECT DATA section. Do NOT paraphrase with different facts.
+3. DO NOT ignore the verified project data in favor of document content. The verified data is the authoritative source.
+4. You may use document content to ADD detail, but never to CONTRADICT or REPLACE the verified project data.
+5. Start your response by directly answering the question using the verified data before adding any supplementary information.
 
 Additional guidelines:
 1. Focus only on information relevant to the query: "{query}"

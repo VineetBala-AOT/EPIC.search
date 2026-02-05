@@ -457,13 +457,21 @@ class BaseParameterExtractor(ParameterExtractor):
                 project_name = proj.get("project_name", "")
                 meta = proj.get("project_metadata", {}) or {}
 
-                # Only include selected fields
+                # Only include selected fields (handle nested dicts safely)
+                proponent_raw = meta.get("proponent", "")
+                if isinstance(proponent_raw, dict):
+                    proponent_name = proponent_raw.get("name", proponent_raw.get("company", ""))
+                elif proponent_raw:
+                    proponent_name = str(proponent_raw)
+                else:
+                    proponent_name = ""
+
                 relevant_meta = {
                     "type": meta.get("type", ""),
                     "region": meta.get("region", ""),
                     "sector": meta.get("sector", ""),
                     "status": meta.get("status", ""),
-                    "proponent": meta.get("proponent", {}).get("name", ""),
+                    "proponent": proponent_name,
                     "description": meta.get("description", ""),
                     "location": meta.get("location", "")
                 }
