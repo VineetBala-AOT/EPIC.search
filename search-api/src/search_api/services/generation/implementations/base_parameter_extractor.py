@@ -564,8 +564,9 @@ Available Projects:
 
 Query: "{query}"
 
-IMPORTANT: Return ONLY projects with confidence >= 0.70. If the query mentions a specific project name,
+IMPORTANT: Return ONLY projects with confidence >= 0.50. If the query mentions a specific project name,
 that project MUST have the highest confidence. Do NOT return projects that only match on generic words.
+Be generous with confidence scores when a distinctive project name (like "Brucejack", "Cariboo", etc.) appears in the query.
 """
 
             logger.info("=== PROJECT EXTRACTION PROMPT (METADATA-AWARE) ===")
@@ -605,11 +606,12 @@ that project MUST have the highest confidence. Do NOT return projects that only 
                         logger.info(f"Match: {project_name} (ID: {project_id}) - Confidence: {confidence} - Reason: {reason}")
                        
                         # Validate project ID exists in available projects
-                        if project_id in valid_ids and confidence >= 0.7:
+                        # Lowered threshold from 0.7 to 0.5 to handle large datasets better
+                        if project_id in valid_ids and confidence >= 0.5:
                             matched_ids.append(project_id)
-                            logger.info(f"  → ACCEPTED: {project_name} added to results")
+                            logger.info(f"  → ACCEPTED: {project_name} added to results (confidence: {confidence})")
                         else:
-                            logger.info(f"  → REJECTED: Confidence too low ({confidence}) or invalid ID")
+                            logger.info(f"  → REJECTED: Confidence too low ({confidence} < 0.5) or invalid ID")
                    
                     logger.info(f"Final matched project IDs: {matched_ids}")
                     logger.info("=== END PROJECT MATCHES ANALYSIS ===")
@@ -684,12 +686,12 @@ that project MUST have the highest confidence. Do NOT return projects that only 
                                     matched_project_id = proj_id
                                     logger.info(f"  Substring match: '{proj_name}' score={score:.2f} -> ID: {proj_id}")
 
-                        if matched_project_id and confidence >= 0.7:
+                        if matched_project_id and confidence >= 0.5:
                             logger.info(f"Pipe-delimited parsing successful: project_id={matched_project_id}, confidence={confidence}")
                             logger.info("=== PROJECT ID EXTRACTION END ===")
                             return [matched_project_id]
                         else:
-                            logger.warning(f"Pipe-delimited parsing found match but confidence too low ({confidence}) or no match found, using fallback")
+                            logger.warning(f"Pipe-delimited parsing found match but confidence too low ({confidence} < 0.5) or no match found, using fallback")
                     else:
                         logger.warning("Pipe-delimited format not parseable, using fallback")
 
@@ -1239,7 +1241,9 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
                                     match_reason.append(f"ngram_match:{ngram}")
 
             # Only include projects with meaningful scores
-            if score >= 0.5:
+            # Lowered threshold from 0.5 to 0.33 to handle projects with multiple distinctive words
+            # e.g., "Pretium Brucejack" where only "brucejack" matches (score = 0.5)
+            if score >= 0.33:
                 scored_projects.append((project_id, project_name, score, match_reason))
                 logger.debug(f"Fallback match: '{project_name}' score={score:.2f} reasons={match_reason}")
 

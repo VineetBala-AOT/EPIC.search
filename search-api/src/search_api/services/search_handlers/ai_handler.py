@@ -208,7 +208,20 @@ class AIHandler(BaseSearchHandler):
                 if not isinstance(project_ids, list) or not all(isinstance(pid, str) for pid in project_ids):
                     current_app.logger.warning(f"🤖 LLM: Invalid project IDs format, clearing: {project_ids}")
                     project_ids = None
-            
+
+            # CRITICAL FALLBACK: If LLM didn't extract project_ids but query mentions a project name,
+            # try direct name matching BEFORE the search (not just for metadata).
+            # This is essential for queries like "what is brucejack project all about" where
+            # the LLM may give low confidence scores when there are many projects.
+            if not project_ids and available_projects:
+                current_app.logger.info(f"🤖 LLM: No project_ids from LLM extraction, trying direct name matching...")
+                matched_by_name = cls._match_project_by_query_text(query, available_projects)
+                if matched_by_name:
+                    project_ids = [matched_by_name]
+                    current_app.logger.info(f"🤖 LLM: Direct name match found project_id: {matched_by_name} - will use for search")
+                else:
+                    current_app.logger.info(f"🤖 LLM: No direct name match found in query")
+
             if not document_type_ids and extraction_result.get('document_type_ids'):
                 document_type_ids = extraction_result['document_type_ids']
                 current_app.logger.info(f"🤖 LLM: Extracted document type IDs: {document_type_ids}")
@@ -641,7 +654,7 @@ For example, you could ask:
         """Match a project by directly comparing query text against project names.
 
         This is a fallback when LLM parameter extraction doesn't return project_ids.
-        Uses simple word-based matching to find the most likely project.
+        Uses word-based and substring matching to find the most likely project.
 
         Args:
             query: The user's query text
@@ -651,18 +664,30 @@ For example, you could ask:
             The project_id of the best matching project, or None
         """
         query_lower = query.lower()
-        # Common words to ignore when matching
+        query_words = set(query_lower.split())
+
+        # Common words to ignore when matching - extended list
         generic_words = {
+            # Query structure words
             'project', 'mine', 'gold', 'the', 'of', 'and', 'a', 'in', 'is', 'what',
             'tell', 'me', 'about', 'for', 'current', 'status', 'describe', 'overview',
             'show', 'get', 'find', 'search', 'all', 'documents', 'document', 'type',
             'schedule', 'certificate', 'letter', 'report', 'how', 'many', 'where',
             'who', 'when', 'which', 'does', 'do', 'are', 'there', 'can', 'you',
-            'phase', 'decision', 'proponent', 'region', 'location'
+            'phase', 'decision', 'proponent', 'region', 'location', 'information',
+            # Industry terms
+            'copper', 'silver', 'coal', 'gas', 'oil', 'lng', 'power', 'energy',
+            'terminal', 'port', 'pipeline', 'transmission', 'line', 'facility',
+            'plant', 'station', 'expansion', 'upgrade', 'development',
+            # Geographic terms
+            'mountain', 'river', 'creek', 'lake', 'valley', 'bc', 'british', 'columbia'
         }
 
         best_match_id = None
         best_score = 0.0
+        best_match_name = ""
+
+        current_app.logger.info(f"🔍 NAME MATCH: Searching {len(available_projects)} projects for query: '{query}'")
 
         for proj in available_projects:
             proj_name = proj.get("project_name", "")
@@ -674,22 +699,47 @@ For example, you could ask:
             proj_words = set(proj_name_lower.split())
             distinctive_words = proj_words - generic_words
 
+            # If no distinctive words remain, use all project words
             if not distinctive_words:
                 distinctive_words = proj_words
-
-            # Count how many distinctive project words appear in the query
-            matches = sum(1 for w in distinctive_words if w in query_lower)
 
             if not distinctive_words:
                 continue
 
-            score = matches / len(distinctive_words)
+            # Method 1: Count how many distinctive project words appear in the query (substring match)
+            matches = sum(1 for w in distinctive_words if w in query_lower)
 
-            # Require at least one distinctive word match with minimum 50% coverage
-            if matches >= 1 and score > best_score and score >= 0.5:
+            # Method 2: Also check if query words appear as substrings of project name
+            # This helps with queries like "brucejack" matching "Brucejack Gold Mine"
+            query_distinctive = query_words - generic_words
+            reverse_matches = sum(1 for w in query_distinctive if len(w) >= 4 and w in proj_name_lower)
+
+            # Take the best of both methods
+            total_matches = max(matches, reverse_matches)
+
+            if total_matches == 0:
+                continue
+
+            # Calculate score based on matches
+            score = total_matches / len(distinctive_words)
+
+            # Bonus for exact word boundary matches (not just substrings)
+            exact_word_matches = len(distinctive_words & query_words)
+            if exact_word_matches > 0:
+                score += 0.1 * exact_word_matches
+
+            # Lower threshold to 0.33 to handle projects with multiple distinctive words
+            # e.g., "Pretium Brucejack" where only "brucejack" matches
+            if total_matches >= 1 and score > best_score and score >= 0.33:
                 best_score = score
                 best_match_id = proj.get("project_id")
-                current_app.logger.info(f"🔍 AI MODE: Name match candidate: '{proj_name}' score={score:.2f} (matched {matches}/{len(distinctive_words)} distinctive words)")
+                best_match_name = proj_name
+                current_app.logger.info(f"🔍 NAME MATCH: Candidate '{proj_name}' score={score:.2f} (matches={total_matches}, distinctive={len(distinctive_words)})")
+
+        if best_match_id:
+            current_app.logger.info(f"🔍 NAME MATCH: Best match is '{best_match_name}' with score {best_score:.2f}")
+        else:
+            current_app.logger.info(f"🔍 NAME MATCH: No matching project found for query")
 
         return best_match_id
 
