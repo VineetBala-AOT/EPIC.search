@@ -226,11 +226,15 @@ Additional context from project documents (use only to supplement, NOT to overri
             ("description", "Description"),
             ("status", "Current Status/Phase"),
             ("type", "Project Type"),
+            ("sector", "Sector"),
             ("proponent", "Proponent"),
             ("region", "Region"),
             ("location", "Location"),
+            ("commodity", "Commodity"),
+            ("ea_status", "EA Status"),
             ("ea_decision", "EA Decision"),
             ("decision_date", "Decision Date"),
+            ("legislation", "Legislation"),
         ]
         for key, label in field_map:
             value = project_metadata.get(key, "")
@@ -261,10 +265,18 @@ Additional context from project documents (use only to supplement, NOT to overri
                 project_parts.append(f"**Region:** {project_metadata['region']}")
             if project_metadata.get("location"):
                 project_parts.append(f"**Location:** {project_metadata['location']}")
+            if project_metadata.get("sector"):
+                project_parts.append(f"**Sector:** {project_metadata['sector']}")
+            if project_metadata.get("commodity"):
+                project_parts.append(f"**Commodity:** {project_metadata['commodity']}")
+            if project_metadata.get("ea_status"):
+                project_parts.append(f"**EA Status:** {project_metadata['ea_status']}")
             if project_metadata.get("ea_decision"):
                 project_parts.append(f"**EA Decision:** {project_metadata['ea_decision']}")
             if project_metadata.get("decision_date"):
                 project_parts.append(f"**Decision Date:** {project_metadata['decision_date']}")
+            if project_metadata.get("legislation"):
+                project_parts.append(f"**Legislation:** {project_metadata['legislation']}")
 
             if project_parts:
                 project_context = "\n\n**PROJECT INFORMATION (use this to provide accurate context in your summary):**\n" + "\n".join(project_parts)

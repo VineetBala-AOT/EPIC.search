@@ -55,30 +55,26 @@ class BaseParameterExtractor(ParameterExtractor):
         logger.info(f"Query to extract from: '{query}'")
         logger.info(f"Use parallel execution: {use_parallel}")
        
-        # Log available context data - SHOW ALL DATA (no truncation)
+        # Log available context data - SUMMARY ONLY (avoid logging all projects for performance)
         logger.info("=== AVAILABLE CONTEXT DATA ===")
         if available_projects:
-            logger.info(f"Available Projects Array ({len(available_projects)}):")
-            for project in available_projects:  # Show ALL projects
+            logger.info(f"Available Projects: {len(available_projects)} total")
+            # Only log first 5 as sample to avoid I/O overhead with large datasets
+            for project in available_projects[:5]:
                 if isinstance(project, dict) and 'project_name' in project and 'project_id' in project:
                     logger.info(f"  - '{project['project_name']}' -> {project['project_id']}")
+            if len(available_projects) > 5:
+                logger.info(f"  ... and {len(available_projects) - 5} more")
         else:
             logger.info("Available Projects: None provided")
-           
+
         if available_document_types:
-            logger.info(f"Available Document Types Array ({len(available_document_types)}):")
-            for doc_type in available_document_types:  # Show ALL document types
-                if isinstance(doc_type, dict) and 'document_type_id' in doc_type:
-                    name = doc_type.get('document_type_name', 'Unknown')
-                    aliases = doc_type.get('aliases', [])
-                    logger.info(f"  - '{name}' (ID: {doc_type['document_type_id']}) - Aliases: {aliases}")
+            logger.info(f"Available Document Types: {len(available_document_types)} total")
         else:
             logger.info("Available Document Types: None provided")
-           
+
         if available_strategies:
-            logger.info(f"Available Strategies ({len(available_strategies)}):")
-            for name, description in available_strategies.items():
-                logger.info(f"  - '{name}': {description}")
+            logger.info(f"Available Strategies: {len(available_strategies)} total")
         else:
             logger.info("Available Strategies: None provided")
            
@@ -150,8 +146,8 @@ class BaseParameterExtractor(ParameterExtractor):
             Dict containing extracted parameters.
         """
         try:
-            logger.info("Starting sequential parameter extraction")
-           
+            logger.info("Starting sequential parameter extraction (optimized: 2 calls instead of 5)")
+
             # Step 1: Extract project IDs (skip if already provided)
             if supplied_project_ids:
                 project_ids = supplied_project_ids
@@ -159,53 +155,34 @@ class BaseParameterExtractor(ParameterExtractor):
             else:
                 project_ids = self._extract_project_ids(query, available_projects_metadata or available_projects)
                 logger.info(f"Step 1 - Extracted project IDs: {project_ids}")
-           
-            # Step 2: Extract document type IDs (skip if already provided)
-            if supplied_document_type_ids:
-                document_type_ids = supplied_document_type_ids
-                logger.info(f"Step 2 - Using supplied document type IDs: {document_type_ids}")
-            else:
-                document_type_ids = self._extract_document_types(query, available_document_types)
-                logger.info(f"Step 2 - Extracted document type IDs: {document_type_ids}")
-           
-            # Step 3: Extract search strategy (skip if already provided)
-            if supplied_search_strategy:
-                search_strategy = supplied_search_strategy
-                logger.info(f"Step 3 - Using supplied search strategy: {search_strategy}")
-            else:
-                search_strategy = self._extract_search_strategy(query, available_strategies)
-                logger.info(f"Step 3 - Extracted search strategy: {search_strategy}")
-           
-            # Step 4: Extract/optimize semantic query (usually always run for query optimization)
-            semantic_query = self._extract_semantic_query(query)
-            logger.info(f"Step 4 - Optimized semantic query: {semantic_query}")
-           
-            # Step 5: Extract temporal parameters (location, project_status, years) using LLM
-            if supplied_location is not None or supplied_project_status is not None or supplied_years is not None:
-                # Use supplied temporal parameters
-                location = supplied_location
-                project_status = supplied_project_status
-                years = supplied_years
-                logger.info(f"Step 5 - Using supplied temporal parameters: location={location}, status={project_status}, years={years}")
-                temporal_sources = {
-                    "location": "supplied" if supplied_location is not None else "fallback",
-                    "project_status": "supplied" if supplied_project_status is not None else "fallback",
-                    "years": "supplied" if supplied_years is not None else "fallback"
+
+            # Step 2: Combined extraction for doc types, strategy, semantic query, temporal/location
+            # This replaces 4 separate LLM calls with 1
+            if (supplied_document_type_ids and supplied_search_strategy and
+                supplied_location is not None and supplied_project_status is not None and supplied_years is not None):
+                # All parameters already supplied
+                combined = {
+                    "document_type_ids": supplied_document_type_ids,
+                    "search_strategy": supplied_search_strategy,
+                    "semantic_query": query,
+                    "location": supplied_location,
+                    "project_status": supplied_project_status,
+                    "years": supplied_years
                 }
+                logger.info(f"Step 2 - All non-project parameters supplied, skipping LLM call")
             else:
-                # Extract temporal and location parameters using LLM
-                temporal_result = self._extract_temporal_and_location_parameters(query, user_location)
-                location = temporal_result.get("location")
-                project_status = temporal_result.get("project_status")
-                years = temporal_result.get("years", [])
-                logger.info(f"Step 5 - Extracted temporal and location parameters: location={location}, status={project_status}, years={years}")
-                temporal_sources = {
-                    "location": "llm_extracted" if location is not None else "fallback",
-                    "project_status": "llm_extracted" if project_status is not None else "fallback",
-                    "years": "llm_extracted" if years else "fallback"
-                }
-           
-            # Combine results
+                combined = self._extract_combined_non_project_parameters(
+                    query, available_document_types, available_strategies, user_location
+                )
+                logger.info(f"Step 2 - Combined extraction: {combined}")
+
+            document_type_ids = supplied_document_type_ids or combined.get("document_type_ids", [])
+            search_strategy = supplied_search_strategy or combined.get("search_strategy", "HYBRID_PARALLEL")
+            semantic_query = combined.get("semantic_query", query)
+            location = supplied_location if supplied_location is not None else combined.get("location")
+            project_status = supplied_project_status if supplied_project_status is not None else combined.get("project_status")
+            years = supplied_years if supplied_years is not None else combined.get("years", [])
+
             return {
                 "project_ids": project_ids,
                 "document_type_ids": document_type_ids,
@@ -217,19 +194,17 @@ class BaseParameterExtractor(ParameterExtractor):
                 "confidence": 0.8,
                 "extraction_sources": {
                     "project_ids": "supplied" if supplied_project_ids else "llm_sequential",
-                    "document_type_ids": "supplied" if supplied_document_type_ids else "llm_sequential",
-                    "search_strategy": "supplied" if supplied_search_strategy else "llm_sequential",
-                    "semantic_query": "llm_sequential",
-                    **temporal_sources
+                    "document_type_ids": "supplied" if supplied_document_type_ids else "llm_combined",
+                    "search_strategy": "supplied" if supplied_search_strategy else "llm_combined",
+                    "semantic_query": "llm_combined",
+                    "location": "supplied" if supplied_location is not None else ("llm_combined" if location is not None else "fallback"),
+                    "project_status": "supplied" if supplied_project_status is not None else ("llm_combined" if project_status is not None else "fallback"),
+                    "years": "supplied" if supplied_years is not None else ("llm_combined" if years else "fallback")
                 }
             }
-           
+
         except Exception as e:
             logger.error(f"Sequential parameter extraction failed: {e}")
-            return self._fallback_extraction(query, available_projects, available_document_types, available_strategies, supplied_project_ids, supplied_document_type_ids, supplied_search_strategy)
-           
-        except Exception as e:
-            logger.error(f"Multi-step parameter extraction failed: {e}")
             return self._fallback_extraction(query, available_projects, available_document_types, available_strategies, supplied_project_ids, supplied_document_type_ids, supplied_search_strategy)
    
     def _extract_parameters_parallel(
@@ -266,10 +241,13 @@ class BaseParameterExtractor(ParameterExtractor):
         try:
             logger.info("Starting parallel parameter extraction")
            
-            # Prepare tasks for parallel execution
+            # OPTIMIZED: Use 2 parallel LLM calls instead of 5
+            # Call 1: Project ID extraction (needs full project list)
+            # Call 2: Combined extraction for doc types, strategy, semantic query, temporal/location
             tasks = []
             task_names = []
             projects_for_llm = []
+
             # Task 1: Extract project IDs (if not supplied)
             if not supplied_project_ids:
                 if available_projects_metadata:
@@ -284,76 +262,74 @@ class BaseParameterExtractor(ParameterExtractor):
 
                 tasks.append(lambda projects=projects_for_llm: self._extract_project_ids(query, projects))
                 task_names.append("project_ids")
-           
-            # Task 2: Extract document type IDs (if not supplied)
-            if not supplied_document_type_ids:
-                tasks.append(lambda: self._extract_document_types(query, available_document_types))
-                task_names.append("document_type_ids")
-           
-            # Task 3: Extract search strategy (if not supplied)
-            if not supplied_search_strategy:
-                tasks.append(lambda: self._extract_search_strategy(query, available_strategies))
-                task_names.append("search_strategy")
-           
-            # Task 4: Extract semantic query (always run for optimization)
-            tasks.append(lambda: self._extract_semantic_query(query))
-            task_names.append("semantic_query")
-           
-            # Task 5: Extract temporal and location parameters (if not supplied)
-            if supplied_location is None or supplied_project_status is None or supplied_years is None:
-                tasks.append(lambda: self._extract_temporal_and_location_parameters(query, user_location))
-                task_names.append("temporal_and_location_parameters")
-           
-            # Execute tasks in parallel using ThreadPoolExecutor
+
+            # Task 2: Combined extraction (doc types + strategy + semantic query + temporal/location)
+            # This replaces 4 separate LLM calls with 1
+            needs_combined = (
+                not supplied_document_type_ids or
+                not supplied_search_strategy or
+                supplied_location is None or
+                supplied_project_status is None or
+                supplied_years is None
+            )
+            if needs_combined:
+                tasks.append(lambda: self._extract_combined_non_project_parameters(
+                    query, available_document_types, available_strategies, user_location
+                ))
+                task_names.append("combined_params")
+
+            # Execute tasks in parallel using ThreadPoolExecutor (max 2 calls now)
             results = {}
-           
+
             if tasks:
-                with ThreadPoolExecutor(max_workers=min(len(tasks), 4)) as executor:
-                    # Submit all tasks
+                logger.info(f"Running {len(tasks)} parallel LLM calls (optimized from 5): {task_names}")
+                with ThreadPoolExecutor(max_workers=min(len(tasks), 2)) as executor:
                     future_to_name = {
                         executor.submit(task): name
                         for task, name in zip(tasks, task_names)
                     }
-                   
-                    # Collect results with timeout
+
                     for future in as_completed(future_to_name, timeout=timeout):
                         task_name = future_to_name[future]
                         try:
                             result = future.result()
                             results[task_name] = result
-                            logger.info(f"Parallel task '{task_name}' completed: {result}")
+                            logger.info(f"Parallel task '{task_name}' completed successfully")
                         except Exception as e:
                             logger.warning(f"Parallel task '{task_name}' failed: {e}")
-                            # Use fallback for failed task
                             results[task_name] = self._get_fallback_for_task(
                                 task_name, query, available_projects,
                                 available_document_types, available_strategies
                             )
-           
-            # Extract temporal and location parameters from results or use supplied values
-            temporal_result = results.get("temporal_and_location_parameters", {})
-            location = supplied_location if supplied_location is not None else temporal_result.get("location")
-            project_status = supplied_project_status if supplied_project_status is not None else temporal_result.get("project_status")
-            years = supplied_years if supplied_years is not None else temporal_result.get("years", [])
-           
-            # Combine results with supplied values
+
+            # Extract combined results
+            combined = results.get("combined_params", {})
+
+            # Build final parameters from combined result + supplied values
+            document_type_ids = supplied_document_type_ids or combined.get("document_type_ids", [])
+            search_strategy = supplied_search_strategy or combined.get("search_strategy", "HYBRID_PARALLEL")
+            semantic_query = combined.get("semantic_query", query)
+            location = supplied_location if supplied_location is not None else combined.get("location")
+            project_status = supplied_project_status if supplied_project_status is not None else combined.get("project_status")
+            years = supplied_years if supplied_years is not None else combined.get("years", [])
+
             return {
                 "project_ids": supplied_project_ids or results.get("project_ids", []),
-                "document_type_ids": supplied_document_type_ids or results.get("document_type_ids", []),
-                "search_strategy": supplied_search_strategy or results.get("search_strategy", "HYBRID_PARALLEL"),
-                "semantic_query": results.get("semantic_query", query),
+                "document_type_ids": document_type_ids,
+                "search_strategy": search_strategy,
+                "semantic_query": semantic_query,
                 "location": location,
                 "project_status": project_status,
                 "years": years,
                 "confidence": 0.8,
                 "extraction_sources": {
                     "project_ids": "supplied" if supplied_project_ids else "llm_parallel",
-                    "document_type_ids": "supplied" if supplied_document_type_ids else "llm_parallel",
-                    "search_strategy": "supplied" if supplied_search_strategy else "llm_parallel",
-                    "semantic_query": "llm_parallel",
-                    "location": "supplied" if supplied_location is not None else ("llm_parallel" if location is not None else "fallback"),
-                    "project_status": "supplied" if supplied_project_status is not None else ("llm_parallel" if project_status is not None else "fallback"),
-                    "years": "supplied" if supplied_years is not None else ("llm_parallel" if years else "fallback")
+                    "document_type_ids": "supplied" if supplied_document_type_ids else "llm_combined",
+                    "search_strategy": "supplied" if supplied_search_strategy else "llm_combined",
+                    "semantic_query": "llm_combined",
+                    "location": "supplied" if supplied_location is not None else ("llm_combined" if location is not None else "fallback"),
+                    "project_status": "supplied" if supplied_project_status is not None else ("llm_combined" if project_status is not None else "fallback"),
+                    "years": "supplied" if supplied_years is not None else ("llm_combined" if years else "fallback")
                 }
             }
            
@@ -396,17 +372,7 @@ class BaseParameterExtractor(ParameterExtractor):
             logger.info("=== PROJECT ID EXTRACTION END ===")
             return []
        
-        logger.info(f"Available projects for matching ({len(available_projects)}):")
-        if isinstance(available_projects, dict):
-            for name, proj_id in available_projects.items():
-                logger.info(f"  - '{name}' -> {proj_id}")
-        elif isinstance(available_projects, list):
-            for proj in available_projects:
-                project_id = proj.get("project_id", "")
-                project_name = proj.get("project_name", "")
-                logger.info(f"  - '{project_name}' -> {project_id}")
-        else:
-            logger.warning("available_projects is neither dict nor list; cannot log contents")
+        logger.info(f"Available projects for matching: {len(available_projects)} total")
        
         # Try LLM extraction with validation and retry
         for attempt in range(3):  # Maximum 3 attempts
@@ -727,11 +693,7 @@ Be generous with confidence scores when a distinctive project name (like "Brucej
             logger.info("=== DOCUMENT TYPE EXTRACTION END ===")
             return []
        
-        logger.info(f"Available document types for matching ({len(available_document_types)}):")
-        for doc_id, doc_data in available_document_types.items():  # Show ALL document types, no truncation
-            name = doc_data.get('name', 'Unknown')
-            aliases = doc_data.get('aliases', [])
-            logger.info(f"  - '{name}' (ID: {doc_id}) - Aliases: {aliases}")
+        logger.info(f"Available document types for matching: {len(available_document_types)} total")
        
         try:
             # Build comprehensive document type info including aliases
@@ -1101,6 +1063,143 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
             logger.info("=== SEMANTIC QUERY EXTRACTION END ===")
             return query
    
+    def _extract_combined_non_project_parameters(
+        self,
+        query: str,
+        available_document_types: Optional[Dict] = None,
+        available_strategies: Optional[Dict] = None,
+        user_location: Optional[Dict] = None
+    ) -> Dict[str, Any]:
+        """Extract document types, search strategy, semantic query, and temporal/location in a SINGLE LLM call.
+
+        This replaces 4 separate LLM calls with 1, saving ~2-3 seconds per request.
+
+        Returns:
+            Dict with keys: document_type_ids, search_strategy, semantic_query, location, project_status, years
+        """
+        logger.info("=== COMBINED NON-PROJECT EXTRACTION START ===")
+
+        # Build document type context
+        doc_context_lines = []
+        if available_document_types:
+            for doc_id, doc_data in available_document_types.items():
+                name = doc_data.get('name', 'Unknown')
+                aliases = doc_data.get('aliases', [])
+                alias_text = f" (aliases: {', '.join(aliases)})" if aliases else ""
+                doc_context_lines.append(f"  - {name}{alias_text} (ID: {doc_id})")
+
+        doc_types_section = chr(10).join(doc_context_lines) if doc_context_lines else "  (none available)"
+
+        # Build strategies list
+        strategies_list = list((available_strategies or {}).keys()) or ["HYBRID_PARALLEL", "SEMANTIC_ONLY", "KEYWORD_ONLY"]
+
+        import datetime
+        current_year = datetime.datetime.now().year
+
+        prompt = f"""You are a search parameter extraction specialist for the Environmental Assessment Office (EAO) of British Columbia.
+Analyze the query and extract ALL of the following parameters in a single JSON response.
+
+QUERY: "{query}"
+USER LOCATION: {user_location if user_location else "Not provided"}
+CURRENT YEAR: {current_year}
+
+=== TASK 1: DOCUMENT TYPES ===
+Select document type IDs relevant to the query. Return [] if the query is general (e.g., "what is the status", "who is the proponent") and not about specific document types.
+Available document types:
+{doc_types_section}
+
+Common mappings: "letter/correspondence" → Letter, "report/study" → Report/Study, "Schedule B/conditions" → Certificate Package or Order, "meeting notes" → Meeting Notes, "application" → Application Materials.
+
+=== TASK 2: SEARCH STRATEGY ===
+Pick exactly one: {', '.join(strategies_list)}
+- Default: "HYBRID_PARALLEL" (use for most queries)
+- "KEYWORD_ONLY": only for exact phrase/literal searches
+- "SEMANTIC_ONLY": only for conceptual/thematic queries
+
+=== TASK 3: SEMANTIC QUERY ===
+Optimize the query for vector search by extracting core search terms.
+Remove filler words like "can you get me", "show me", "tell me about".
+Keep project names, locations, environmental terms, regulatory terms (Schedule B, condition, certificate).
+Return 2-10 key terms.
+
+=== TASK 4: TEMPORAL & LOCATION ===
+- location: Extract geographic references as a string (e.g., "Vancouver, BC", "Peace River region"). Return null if query is about a specific project, not a geographic search.
+- project_status: Extract lifecycle indicators (active, completed, recent, ongoing). Return null if none mentioned.
+- years: Extract specific years or ranges. Map "recently" → last 2-3 years, "this year" → [{current_year}].
+
+Respond with ONLY this JSON (no explanation):
+{{
+    "document_type_ids": [],
+    "search_strategy": "HYBRID_PARALLEL",
+    "semantic_query": "optimized search terms",
+    "location": null,
+    "project_status": null,
+    "years": []
+}}"""
+
+        try:
+            response = self._make_llm_call(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+
+            content = response["choices"][0]["message"]["content"].strip()
+            logger.info(f"Combined extraction raw response: {content[:500]}")
+
+            # Parse JSON response
+            # Strip markdown code fences if present
+            if content.startswith("```"):
+                content = content.split("\n", 1)[1] if "\n" in content else content[3:]
+                if content.endswith("```"):
+                    content = content[:-3].strip()
+                elif "```" in content:
+                    content = content[:content.rfind("```")].strip()
+
+            result = json.loads(content)
+
+            # Validate document_type_ids
+            doc_type_ids = result.get("document_type_ids", [])
+            if doc_type_ids and available_document_types:
+                valid_ids = set(available_document_types.keys())
+                doc_type_ids = [dtid for dtid in doc_type_ids if dtid in valid_ids]
+
+            # Validate search strategy
+            search_strategy = result.get("search_strategy", "HYBRID_PARALLEL")
+            if search_strategy not in strategies_list:
+                search_strategy = "HYBRID_PARALLEL"
+
+            # Validate semantic query
+            semantic_query = result.get("semantic_query", query)
+            if not semantic_query or len(semantic_query) > len(query) * 1.5:
+                semantic_query = query
+
+            extracted = {
+                "document_type_ids": doc_type_ids,
+                "search_strategy": search_strategy,
+                "semantic_query": semantic_query,
+                "location": result.get("location"),
+                "project_status": result.get("project_status"),
+                "years": result.get("years", [])
+            }
+
+            logger.info(f"Combined extraction result: doc_types={doc_type_ids}, strategy={search_strategy}, "
+                         f"semantic='{semantic_query}', location={extracted['location']}, "
+                         f"status={extracted['project_status']}, years={extracted['years']}")
+            logger.info("=== COMBINED NON-PROJECT EXTRACTION END ===")
+            return extracted
+
+        except Exception as e:
+            logger.warning(f"Combined extraction failed: {e}, using defaults")
+            logger.info("=== COMBINED NON-PROJECT EXTRACTION END ===")
+            return {
+                "document_type_ids": self._fallback_document_extraction(query, available_document_types or {}),
+                "search_strategy": "HYBRID_PARALLEL",
+                "semantic_query": query,
+                "location": None,
+                "project_status": None,
+                "years": []
+            }
+
     def _fallback_project_extraction(self, query: str, available_projects: Union[Dict, List]) -> List[str]:
         """Enhanced fallback project extraction with strict name matching and similarity scoring.
 
