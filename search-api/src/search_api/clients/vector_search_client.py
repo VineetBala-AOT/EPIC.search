@@ -47,10 +47,17 @@ The vector API uses both parameters:
 
 import os
 import requests
+from requests.adapters import HTTPAdapter
 from typing import Optional
 from flask import current_app
 from ..utils.cache import cache_with_ttl
 from ..utils.token_info import get_user_id
+
+# Module-level session with connection pooling — avoids TCP handshake overhead on every call
+_session = requests.Session()
+_adapter = HTTPAdapter(pool_connections=20, pool_maxsize=50, max_retries=3)
+_session.mount('http://', _adapter)
+_session.mount('https://', _adapter)
 
 class VectorSearchClient:
     """Client for communicating with the external vector search API."""
@@ -60,7 +67,8 @@ class VectorSearchClient:
     # =============================================================================
 
     @staticmethod
-    def search(query, project_ids=None, document_type_ids=None, project_names=None, document_type_names=None, inference=None, ranking=None, search_strategy=None, semantic_query=None, location=None, user_location=None, project_status=None, years=None):
+    @cache_with_ttl(ttl_seconds=300)
+    def search(query, project_ids=None, document_type_ids=None, project_names=None, document_type_names=None, inference=None, ranking=None, search_strategy=None, semantic_query=None, location=None, user_location=None, project_status=None, years=None, semantic_fetch_count=None, keyword_fetch_count=None):
         """Advanced two-stage hybrid search with comprehensive parameters.
         
         Endpoint: POST /vector-search
@@ -165,13 +173,21 @@ class VectorSearchClient:
                 payload["projectStatus"] = project_status
             if years:
                 payload["years"] = years
+            if semantic_fetch_count is not None:
+                payload["semanticFetchCount"] = semantic_fetch_count
+            if keyword_fetch_count is not None:
+                payload["keywordFetchCount"] = keyword_fetch_count
             # Note: We don't send semanticQuery separately since we're using it as the primary query
                 
             current_app.logger.info(f"Calling vector search API at address: {vector_search_url}")
             current_app.logger.info(f"Search payload: {payload}")
             if semantic_query:
                 current_app.logger.info(f"Using semantic query as primary query: '{semantic_query}' (original: '{query}')")
-            response = requests.post(vector_search_url, json=payload, timeout=300)
+            import time as _time
+            _http_start = _time.time()
+            response = _session.post(vector_search_url, json=payload, timeout=120)
+            _http_ms = round((_time.time() - _http_start) * 1000, 2)
+            current_app.logger.info(f"⏱️ VECTOR API HTTP call took: {_http_ms}ms (includes vector-api processing + network)")
             response.raise_for_status()
 
             api_response = response.json()
@@ -232,6 +248,24 @@ class VectorSearchClient:
             }
 
     @staticmethod
+    def match_projects_by_embedding(query: str, top_k: int = 3, threshold: float = 0.55) -> list:
+        """Fast semantic project matching using the vector-api's pre-computed embeddings.
+
+        Returns a list of {"project_id", "project_name", "score"} sorted by score descending,
+        or an empty list if the call fails (caller should fall back to LLM).
+        """
+        try:
+            base_url = os.getenv("VECTOR_SEARCH_API_URL", "http://localhost:8080/api")
+            url = f"{base_url}/tools/match-projects"
+            payload = {"query": query, "top_k": top_k, "threshold": threshold}
+            response = _session.post(url, json=payload, timeout=10)
+            response.raise_for_status()
+            return response.json().get("matches", [])
+        except Exception as exc:
+            current_app.logger.warning(f"Embedding project match failed (will fall back to LLM): {exc}")
+            return []
+
+    @staticmethod
     def document_similarity_search(document_id, project_ids=None, limit=10):
         """Document-level embedding similarity search.
         
@@ -258,7 +292,7 @@ class VectorSearchClient:
                 payload["projectIds"] = project_ids
                 
             current_app.logger.info(f"Calling vector search document similarity API at: {vector_search_url}")
-            response = requests.post(vector_search_url, json=payload, timeout=300)
+            response = _session.post(vector_search_url, json=payload, timeout=30)
             response.raise_for_status()
             
             return response.json()
@@ -271,7 +305,7 @@ class VectorSearchClient:
     # =============================================================================
 
     @staticmethod
-    @cache_with_ttl(ttl_seconds=86400)  # Cache for 24 hours (86400 seconds)
+    @cache_with_ttl(ttl_seconds=1800)  # Cache for 30 minutes — balances freshness vs vector-api call volume
     def get_projects_list(include_metadata: bool = False):
         """Get list of available projects for filtering (optionally with metadata).
         
@@ -286,7 +320,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/tools/projects"
             
             current_app.logger.info(f"Calling vector search projects list API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=60)
             response.raise_for_status()
             
             data = response.json()
@@ -316,7 +350,7 @@ class VectorSearchClient:
             return []
 
     @staticmethod
-    @cache_with_ttl(ttl_seconds=86400)  # Cache for 24 hours (86400 seconds)
+    @cache_with_ttl(ttl_seconds=3600)  # Cache for 1 hour — document types change rarely
     def get_document_types():
         """Get document types with aliases and descriptions.
         
@@ -331,7 +365,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/tools/document-types"
             
             current_app.logger.info(f"Calling vector search document types API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=30)
             response.raise_for_status()
             
             data = response.json()
@@ -376,7 +410,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/tools/document-types/{type_id}"
             
             current_app.logger.info(f"Calling vector search document type details API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=10)
             response.raise_for_status()
             
             return response.json()
@@ -400,7 +434,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/tools/search-strategies"
             
             current_app.logger.info(f"Calling vector search strategies API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=10)
             response.raise_for_status()
             
             return response.json()
@@ -423,7 +457,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/tools/inference-options"
             
             current_app.logger.info(f"Calling vector search inference options API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=10)
             response.raise_for_status()
             
             return response.json()
@@ -446,7 +480,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/tools/api-capabilities"
             
             current_app.logger.info(f"Calling vector search capabilities API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=10)
             response.raise_for_status()
             
             return response.json()
@@ -479,7 +513,7 @@ class VectorSearchClient:
             if project_ids:
                 current_app.logger.info(f"Note: project_ids filter ({project_ids}) ignored - vector API handles filtering internally")
             
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=10)
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -504,7 +538,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/stats/processing/{project_id}"
             
             current_app.logger.info(f"Calling vector search project details API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=10)
             response.raise_for_status()
             
             return response.json()
@@ -527,7 +561,7 @@ class VectorSearchClient:
             vector_search_url = f"{base_url}/stats/summary"
             
             current_app.logger.info(f"Calling vector search system summary API at: {vector_search_url}")
-            response = requests.get(vector_search_url, timeout=300)
+            response = _session.get(vector_search_url, timeout=10)
             response.raise_for_status()
             
             return response.json()
@@ -564,7 +598,7 @@ class VectorSearchClient:
                     params["project_ids"] = ",".join(project_ids)
             
             current_app.logger.info(f"Calling vector search project health API at: {vector_search_url}")
-            response = requests.get(vector_search_url, params=params, timeout=300)
+            response = _session.get(vector_search_url, params=params, timeout=10)
             response.raise_for_status()
             
             return response.json()
@@ -607,7 +641,7 @@ class VectorSearchClient:
                 payload["searchResult"] = search_result
 
             current_app.logger.info(f"Creating feedback session via POST {url} with payload: {payload}")
-            response = requests.post(url, json=payload, timeout=300)
+            response = _session.post(url, json=payload, timeout=10)
             response.raise_for_status()
             data = response.json()
             return data.get("sessionId")
@@ -656,7 +690,7 @@ class VectorSearchClient:
             }
 
             current_app.logger.info(f"Updating feedback via PATCH {url} with payload: {payload}")
-            response = requests.patch(url, json=payload, timeout=300)
+            response = _session.patch(url, json=payload, timeout=10)
             response.raise_for_status()
             return True
 

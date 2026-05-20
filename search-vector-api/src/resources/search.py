@@ -168,6 +168,12 @@ class SearchRequestSchema(Schema):
                               metadata={"description": "Optional project status context to enhance search relevance (e.g., 'recent', 'active', 'completed'). Currently appended to search query for improved semantic matching."})
     years = fields.List(fields.Int(), data_key="years", required=False,
                        metadata={"description": "Optional list of years to focus search on (e.g., [2023, 2024, 2025]). Currently appended to search query for improved semantic matching."})
+    semanticFetchCount = fields.Int(data_key="semanticFetchCount", required=False,
+                                    validate=lambda x: 5 <= x <= 200,
+                                    metadata={"description": "Override the number of semantic candidates fetched before re-ranking (5-200). Defaults to SEMANTIC_FETCH_COUNT env var."})
+    keywordFetchCount = fields.Int(data_key="keywordFetchCount", required=False,
+                                   validate=lambda x: 5 <= x <= 200,
+                                   metadata={"description": "Override the number of keyword candidates fetched before re-ranking (5-200). Defaults to KEYWORD_FETCH_COUNT env var."})
 
 
 API = Namespace("vector-search", description="Endpoints for semantic and keyword vector search operations")
@@ -280,7 +286,9 @@ class Search(Resource):
         location = request_data.get("location", None)  # Optional parameter
         project_status = request_data.get("projectStatus", None)  # Optional parameter
         years = request_data.get("years", None)  # Optional parameter
-        
+        semantic_fetch_count = request_data.get("semanticFetchCount", None)  # Optional override
+        keyword_fetch_count = request_data.get("keywordFetchCount", None)   # Optional override
+
         # Extract ranking parameters with fallback to None (will use env defaults)
         min_relevance_score = ranking_config.get("minScore") if ranking_config else None
         top_n = ranking_config.get("topN") if ranking_config else None
@@ -324,7 +332,7 @@ class Search(Resource):
         if query_enhancements:
             enhanced_query = f"{query} ({' | '.join(query_enhancements)})"
         
-        documents = SearchService.get_documents_by_query(enhanced_query, project_ids, document_type_ids, inference, min_relevance_score, top_n, search_strategy, semantic_query)
+        documents = SearchService.get_documents_by_query(enhanced_query, project_ids, document_type_ids, inference, min_relevance_score, top_n, search_strategy, semantic_query, semantic_fetch_count=semantic_fetch_count, keyword_fetch_count=keyword_fetch_count)
         return Response(
             json.dumps(documents), status=HTTPStatus.OK, mimetype="application/json"
         )

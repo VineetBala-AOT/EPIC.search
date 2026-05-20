@@ -144,11 +144,24 @@ class SearchSettings:
     @property
     def max_chunks_per_document(self) -> int:
         """Get the maximum number of chunks to return per document.
-        
+
         Returns:
             int: The maximum number of chunks allowed per document in search results
         """
         return self._config.get("MAX_CHUNKS_PER_DOCUMENT")
+
+    @property
+    def max_chunks_per_project(self) -> int:
+        """Get the maximum number of chunks to return per project when multiple projects are searched.
+
+        When a search spans multiple project IDs, this cap prevents one high-similarity
+        project from monopolising all result slots. Applied via a SQL window-function CTE.
+        Set to 0 to disable per-project capping.
+
+        Returns:
+            int: The maximum number of chunks allowed per project in multi-project searches
+        """
+        return self._config.get("MAX_CHUNKS_PER_PROJECT")
     
     @property
     def parallel_search_timeout(self) -> int:
@@ -349,10 +362,11 @@ class _Config:  # pylint: disable=too-few-public-methods
 
     # Search Configuration
     VECTOR_TABLE = os.getenv("VECTOR_TABLE", "document_chunks")
-    KEYWORD_FETCH_COUNT = int(os.getenv("KEYWORD_FETCH_COUNT", "100"))
-    SEMANTIC_FETCH_COUNT = int(os.getenv("SEMANTIC_FETCH_COUNT", "100"))
-    MAX_CHUNKS_PER_DOCUMENT = int(os.getenv("MAX_CHUNKS_PER_DOCUMENT", "10"))
-    PARALLEL_SEARCH_TIMEOUT = int(os.getenv("PARALLEL_SEARCH_TIMEOUT", "60"))
+    KEYWORD_FETCH_COUNT = int(os.getenv("KEYWORD_FETCH_COUNT", "40"))
+    SEMANTIC_FETCH_COUNT = int(os.getenv("SEMANTIC_FETCH_COUNT", "40"))
+    MAX_CHUNKS_PER_DOCUMENT = int(os.getenv("MAX_CHUNKS_PER_DOCUMENT", "5"))
+    MAX_CHUNKS_PER_PROJECT = int(os.getenv("MAX_CHUNKS_PER_PROJECT", "5"))
+    PARALLEL_SEARCH_TIMEOUT = int(os.getenv("PARALLEL_SEARCH_TIMEOUT", "10"))
     PARALLEL_RESULT_COLLECTION_TIMEOUT = int(os.getenv("PARALLEL_RESULT_COLLECTION_TIMEOUT", "5"))
     ENABLE_PARALLEL_FALLBACK = os.getenv("ENABLE_PARALLEL_FALLBACK", "true").lower() == "true"
     TOP_RECORD_COUNT = int(os.getenv("TOP_RECORD_COUNT", "10"))

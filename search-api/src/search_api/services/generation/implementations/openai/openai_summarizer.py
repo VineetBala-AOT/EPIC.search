@@ -1,7 +1,7 @@
 """OpenAI summarizer implementation."""
 
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Generator, List, Dict, Any, Optional
 from flask import current_app
 from .openai_client import OpenAIClient
 from ...abstractions.summarizer import Summarizer
@@ -203,6 +203,62 @@ Additional context from project documents (use only to supplement, NOT to overri
             # Return the summary as fallback
             return f"Based on the available documents, here's what I found:\n\n{summary}"
     
+    def summarize_documents_stream(
+        self,
+        documents: List[Dict[str, Any]],
+        query: str,
+        context: Optional[str] = None,
+        project_metadata: Optional[Dict] = None
+    ) -> Generator[str, None, None]:
+        """Stream summary tokens for a list of documents.
+
+        Identical prompt logic to summarize_documents() but uses the streaming
+        OpenAI API so the caller can forward tokens to the client immediately.
+
+        Yields:
+            str: Text token chunks as they arrive from the API.
+        """
+        if not documents:
+            yield "No documents found to summarize."
+            return
+
+        prompt = self._build_summarization_prompt(query, context, project_metadata)
+        doc_content = self._prepare_document_content(documents)
+        is_project_query = self._is_project_level_query(query) if project_metadata else False
+
+        if project_metadata and is_project_query:
+            formatted_metadata = self._format_project_metadata_for_message(project_metadata)
+            limited_doc_content = doc_content[:1500] if doc_content else ""
+            user_content = (
+                f"Query: {query}\n\n"
+                "YOU MUST ANSWER THIS QUERY USING THE VERIFIED PROJECT DATA BELOW AS YOUR PRIMARY SOURCE.\n"
+                "State the facts from the verified data directly in your response.\n\n"
+                f"{formatted_metadata}\n\n"
+                "Additional context from project documents (use only to supplement, NOT to override the verified data above):\n"
+                f"{limited_doc_content}"
+            )
+        else:
+            user_content = (
+                f"Query: {query}\n\n"
+                "Summarize the key regulatory findings, project implications, and compliance notes "
+                f"from these documents:\n{doc_content}"
+            )
+
+        messages = [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        try:
+            yield from self.client.chat_completion_stream(
+                messages=messages,
+                temperature=self.temperature,
+                max_tokens=min(self.max_tokens, 2000),
+            )
+        except Exception as e:
+            logger.error(f"Streaming summarization failed: {e}")
+            yield self._fallback_summary(documents, query)
+
     def _is_project_level_query(self, query: str) -> bool:
         """Check if the query is asking about the project itself (overview, status, etc.)."""
         query_lower = query.lower()

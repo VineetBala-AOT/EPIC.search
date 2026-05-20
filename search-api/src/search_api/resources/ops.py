@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Endpoints to check and manage the health of the service."""
-from flask import current_app
+from flask import current_app, request
 from flask_restx import Namespace, Resource
 
 # from api.models import db
 from ..utils.run_version import get_run_version
+from ..auth import auth
 
 
 API = Namespace('', description='Service - OPS checks')
@@ -117,17 +118,56 @@ class CacheStatus(Resource):
     def delete():
         """Clear expired cache entries."""
         current_app.logger.info("Cache cleanup endpoint called")
-        
+
         try:
             from ..utils.cache import clear_expired_cache
             cleared_count = clear_expired_cache()
-            
+
             current_app.logger.info(f"Cache cleanup completed: {cleared_count} expired entries removed")
             return {
                 'message': 'Cache cleanup completed',
                 'expired_entries_removed': cleared_count
             }, 200
-            
+
         except Exception as e:
             current_app.logger.error(f"Error clearing cache: {e}")
             return {'error': 'Failed to clear cache', 'message': str(e)}, 500
+
+    @staticmethod
+    @auth.requires_epic_search_role(["admin"])
+    def post():
+        """Force-refresh project metadata and document type caches (admin only).
+
+        Call this after EPIC updates project phase/status/proponent so search
+        picks up the new values within seconds rather than waiting up to 30 min.
+
+        Optional JSON body: {"target": "projects"} or {"target": "document_types"}
+        to clear only one cache.  Omit or use {"target": "all"} to clear both.
+        """
+        current_app.logger.info("Cache invalidation endpoint called")
+
+        try:
+            from ..utils.cache import clear_cache_by_prefix, clear_cache
+
+            body = request.get_json(silent=True) or {}
+            target = body.get("target", "all")
+
+            removed = {}
+            if target in ("all", "projects"):
+                removed["projects"] = clear_cache_by_prefix("get_projects_list")
+                current_app.logger.info(f"Cleared {removed['projects']} project cache entries")
+
+            if target in ("all", "document_types"):
+                removed["document_types"] = clear_cache_by_prefix("get_document_types")
+                current_app.logger.info(f"Cleared {removed['document_types']} document_type cache entries")
+
+            total = sum(removed.values())
+            current_app.logger.info(f"Cache invalidation complete: {total} entries removed ({removed})")
+            return {
+                "message": "Cache cleared — next query will fetch fresh data from the database",
+                "entries_removed": removed,
+            }, 200
+
+        except Exception as e:
+            current_app.logger.error(f"Error clearing cache: {e}")
+            return {"error": "Failed to clear cache", "message": str(e)}, 500

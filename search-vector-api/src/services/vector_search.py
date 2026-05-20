@@ -152,7 +152,7 @@ def get_document_display_name(document_metadata, chunk_metadata=None):
     return None
 
 
-def search(question, project_ids=None, document_type_ids=None, min_relevance_score=None, top_n=None, search_strategy=None, semantic_query=None):
+def search(question, project_ids=None, document_type_ids=None, min_relevance_score=None, top_n=None, search_strategy=None, semantic_query=None, semantic_fetch_count=None, keyword_fetch_count=None):
     """Main search entry point that routes requests to appropriate search strategies.
     
     This function serves as the primary interface for search functionality. It handles:
@@ -198,9 +198,9 @@ def search(question, project_ids=None, document_type_ids=None, min_relevance_sco
     metrics = {}
     start_time = time.time()
     
-    # Use strongly typed configuration properties
-    doc_limit = current_app.search_settings.keyword_fetch_count  # Number of documents to find
-    chunk_limit = current_app.search_settings.semantic_fetch_count  # Number of chunks to return
+    # Use strongly typed configuration properties, but allow per-request overrides
+    doc_limit = keyword_fetch_count if keyword_fetch_count is not None else current_app.search_settings.keyword_fetch_count
+    chunk_limit = semantic_fetch_count if semantic_fetch_count is not None else current_app.search_settings.semantic_fetch_count
     
     # Use provided top_n parameter or fall back to config value
     original_top_n = top_n
@@ -745,9 +745,22 @@ def perform_semantic_search_all_chunks(vec_store, query, limit, project_ids=None
     import logging
     logging.info(f"Semantic search all chunks - table: {table_name}, query: '{query}', limit: {limit}, predicates: {predicates}")
     
+    # When multiple projects are searched, apply per-project capping via SQL window function
+    # to prevent one high-similarity project from monopolising all result slots.
+    max_per_project = None
+    effective_limit = limit
+    if project_ids and len(project_ids) > 1:
+        max_per_project = current_app.search_settings.max_chunks_per_project
+        if max_per_project and max_per_project > 0:
+            # Scale the outer LIMIT so all projects can contribute their quota.
+            # Cap at 3× the normal limit to avoid excessive SQL scan time.
+            effective_limit = min(len(project_ids) * max_per_project, limit * 3)
+            logging.info(f"Semantic search all chunks - scaled limit to {effective_limit} for {len(project_ids)} projects × {max_per_project} chunks/project")
+
     # Perform semantic search on all chunks
     semantic_results = vec_store.semantic_search(
-        table_name, query, limit=limit, predicates=predicates, return_dataframe=True
+        table_name, query, limit=effective_limit, predicates=predicates, return_dataframe=True,
+        max_per_project=max_per_project
     )
     
     if not semantic_results.empty:

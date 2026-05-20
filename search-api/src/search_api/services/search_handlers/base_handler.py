@@ -7,7 +7,7 @@ import os
 import time
 import traceback
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Any
+from typing import Dict, Generator, List, Optional, Any
 from flask import current_app
 
 from search_api.clients.vector_search_client import VectorSearchClient
@@ -50,34 +50,23 @@ class BaseSearchHandler(ABC):
         pass
     
     @classmethod
-    def _execute_vector_search(cls, query: str, project_ids: Optional[List[str]], 
-                              document_type_ids: Optional[List[str]], 
-                              inference: Optional[List], ranking: Optional[Dict], 
-                              search_strategy: Optional[str], semantic_query: Optional[str], 
-                              metrics: Dict, location: Optional[str] = None, 
+    def _execute_vector_search(cls, query: str, project_ids: Optional[List[str]],
+                              document_type_ids: Optional[List[str]],
+                              inference: Optional[List], ranking: Optional[Dict],
+                              search_strategy: Optional[str], semantic_query: Optional[str],
+                              metrics: Dict, location: Optional[str] = None,
                               user_location: Optional[Dict] = None,
-                              project_status: Optional[str] = None, 
-                              years: Optional[List] = None) -> Dict[str, Any]:
+                              project_status: Optional[str] = None,
+                              years: Optional[List] = None,
+                              _override_result: Optional[tuple] = None,
+                              semantic_fetch_count: Optional[int] = None,
+                              keyword_fetch_count: Optional[int] = None) -> Dict[str, Any]:
         """Execute vector search and process the response.
-        
-        Args:
-            query (str): The original search query
-            project_ids (list): Project IDs for filtering
-            document_type_ids (list): Document type IDs for filtering
-            inference (list): Inference settings
-            ranking (dict): Ranking configuration
-            search_strategy (str): Search strategy to use
-            semantic_query (str): Processed semantic query (may be None)
-            metrics (dict): Metrics dictionary to update
-            location (str): Geographic search filter INFERRED from query text (e.g., "Vancouver, BC", "Peace River region")
-                           This is NOT user-provided - it's extracted from the query by AI/Agent modes only
-            user_location (dict): User's physical location from browser (latitude, longitude, city, region, etc.)
-                                 This is ALWAYS passed through when provided by the user
-            project_status (str): Project status parameter for status filtering
-            years (list): Years parameter for temporal filtering
 
-        Returns:
-            dict: Search result containing documents_or_chunks, search metadata, etc.
+        Args:
+            _override_result: Optional (documents, chunks, api_response) tuple.
+                When provided the HTTP call to the vector API is skipped entirely
+                and the supplied data is used directly (speculative search path).
         """
         current_app.logger.info("=== VECTOR SEARCH: Starting search execution ===")
 
@@ -97,22 +86,37 @@ class BaseSearchHandler(ABC):
         current_app.logger.info(f"🔎 SEARCH PARAMS: semantic_query={semantic_query}")
         current_app.logger.info(f"🔎 SEARCH PARAMS: location={location}, project_status={project_status}, years={years}")
 
-        # Perform the vector DB search by calling the vector search api
-        current_app.logger.info("Starting vector search...")
+        # Apply a default result cap if the caller didn't specify one.
+        # Without a topN limit the vector API scans the entire dataset which is
+        # very slow on large corpora — 15 focused results are enough for a summary.
+        if not ranking:
+            ranking = {"topN": 15}
+        elif isinstance(ranking, dict) and "topN" not in ranking:
+            ranking = {**ranking, "topN": 15}
+
+        # Perform the vector DB search — use pre-fetched speculative data when available
+        current_app.logger.info(f"🔎 SEARCH PARAMS: ranking={ranking}")
         search_start = time.time()
-        documents, document_chunks, vector_api_response = VectorSearchClient.search(
-            query=query, 
-            project_ids=project_ids, 
-            document_type_ids=document_type_ids, 
-            inference=inference, 
-            ranking=ranking, 
-            search_strategy=search_strategy,
-            semantic_query=semantic_query,
-            location=location,
-            project_status=project_status,
-            years=years,
-            user_location=user_location
-        )
+        if _override_result is not None:
+            documents, document_chunks, vector_api_response = _override_result
+            current_app.logger.info("⚡ VECTOR SEARCH: using speculative pre-fetched results (HTTP call skipped)")
+        else:
+            current_app.logger.info("Starting vector search...")
+            documents, document_chunks, vector_api_response = VectorSearchClient.search(
+                query=query,
+                project_ids=project_ids,
+                document_type_ids=document_type_ids,
+                inference=inference,
+                ranking=ranking,
+                search_strategy=search_strategy,
+                semantic_query=semantic_query,
+                location=location,
+                project_status=project_status,
+                years=years,
+                user_location=user_location,
+                semantic_fetch_count=semantic_fetch_count,
+                keyword_fetch_count=keyword_fetch_count,
+            )
         search_duration = round((time.time() - search_start) * 1000, 2)
         current_app.logger.info(f"Vector search completed in {search_duration}ms")
         current_app.logger.info(f"Documents returned: {len(documents) if documents else 0}")
@@ -280,7 +284,41 @@ class BaseSearchHandler(ABC):
             }
     
     @classmethod
-    def _generate_rag_summary(cls, documents_or_chunks: List, query: str, 
+    def _generate_agentic_summary_stream(
+        cls,
+        documents_or_chunks: List,
+        query: str,
+        project_metadata: Optional[Dict] = None
+    ) -> Generator[str, None, None]:
+        """Stream the AI summary token-by-token using the configured summarizer.
+
+        Falls back to a single-chunk yield if the summarizer does not support
+        streaming (e.g. Ollama).
+
+        Yields:
+            str: Text token chunks.
+        """
+        from search_api.services.generation.factories import SummarizerFactory
+
+        summarizer = SummarizerFactory.create_summarizer()
+
+        if hasattr(summarizer, "summarize_documents_stream"):
+            yield from summarizer.summarize_documents_stream(
+                documents=documents_or_chunks,
+                query=query,
+                project_metadata=project_metadata,
+            )
+        else:
+            # Non-streaming fallback: return entire summary as one chunk
+            result = summarizer.summarize_search_results(
+                query=query,
+                documents_or_chunks=documents_or_chunks,
+                search_context={"project_metadata": project_metadata} if project_metadata else {},
+            )
+            yield result.get("summary", "")
+
+    @classmethod
+    def _generate_rag_summary(cls, documents_or_chunks: List, query: str,
                              metrics: Dict) -> Dict[str, Any]:
         """Generate basic summary for RAG mode (non-agentic).
         
@@ -346,20 +384,37 @@ class BaseSearchHandler(ABC):
             documents_or_chunks (list): Retrieved documents or document chunks
             query (str): The original search query
         """
-        current_app.logger.info(f"🤖 AGENTIC SUMMARY: Query processing completed successfully")
-        current_app.logger.info(f"🤖 Total execution time: {metrics['total_time_ms']}ms")
-        current_app.logger.info(f"🤖 Vector search time: {search_duration}ms, LLM time: {metrics.get('llm_time_ms', 'N/A')}ms")
-        current_app.logger.info(f"🤖 Search quality assessment: {search_quality}")
-        current_app.logger.info(f"🤖 Documents retrieved: {len(documents_or_chunks) if documents_or_chunks else 0}")
-        current_app.logger.info(f"🤖 Query processed: '{query[:100]}{'...' if len(query) > 100 else ''}'")
-        
-        # Log AI processing metrics if available
-        if metrics.get('ai_processing_time_ms'):
-            current_app.logger.info(f"🤖 AI processing time: {metrics['ai_processing_time_ms']}ms")
-        if metrics.get('query_relevance'):
-            relevance = metrics['query_relevance']
-            current_app.logger.info(f"🤖 Query relevance: {relevance.get('is_eao_relevant', 'N/A')}, "
-                                  f"Confidence: {relevance.get('confidence', 'N/A')}")
+        doc_count = len(documents_or_chunks) if documents_or_chunks else 0
+        total_ms = metrics.get("total_time_ms", 0)
+        timing = metrics.get("timing", {})
+
+        current_app.logger.info(
+            f"🤖 DONE | query='{query[:80]}{'...' if len(query) > 80 else ''}' | "
+            f"docs={doc_count} | quality={search_quality} | total={total_ms}ms"
+        )
+
+        if timing:
+            # Pretty breakdown table in logs
+            rows = [
+                ("parallel_setup",    timing.get("parallel_setup_ms", 0)),
+                ("  relevance_check", timing.get("relevance_check_ms", 0)),
+                ("early_detection",   timing.get("early_detection_ms", 0)),
+                ("llm_extraction",    timing.get("llm_extraction_ms", 0)),
+                ("post_llm_process",  timing.get("post_llm_processing_ms", 0)),
+                ("vector_search",     timing.get("vector_search_ms", 0)),
+                ("metadata_lookup",   timing.get("project_metadata_ms", 0)),
+                ("summary_gen",       timing.get("summary_generation_ms", 0)),
+            ]
+            current_app.logger.info("⏱️ Stage breakdown:")
+            for label, ms in rows:
+                pct = f"{ms/total_ms*100:.0f}%" if total_ms else "?"
+                bar = "█" * min(int(ms / max(total_ms, 1) * 30), 30)
+                current_app.logger.info(f"   {label:<22} {ms:>7.0f}ms  {pct:>4}  {bar}")
+            current_app.logger.info(f"   {'TOTAL':<22} {total_ms:>7.0f}ms  100%")
+            if timing.get("speculative_used"):
+                current_app.logger.info("   ⚡ speculative search result was reused (vector round-trip skipped)")
+        else:
+            current_app.logger.info(f"🤖 Vector search: {search_duration}ms | LLM: {metrics.get('llm_time_ms', 'N/A')}ms")
 
     @classmethod
     def _log_basic_summary(cls, documents_or_chunks: List, query: str) -> None:

@@ -10,6 +10,7 @@ import logging
 import os
 
 from flask import Flask
+from psycopg_pool import ConnectionPool
 
 from utils.config import get_named_config, VectorSettings, SearchSettings, ModelSettings
 from utils.version import get_version
@@ -57,4 +58,39 @@ def create_app(run_mode=os.getenv("FLASK_ENV", "development")):
     app.search_settings = SearchSettings(app.config)
     app.model_settings = ModelSettings(app.config)
 
+    # Initialize PostgreSQL connection pool (reused across requests, eliminating per-query TCP overhead)
+    app.db_pool = ConnectionPool(
+        conninfo=app.vector_settings.database_url,
+        min_size=2,
+        max_size=10,
+        open=True,
+    )
+    LOGGER.info("PostgreSQL connection pool initialized (min=2, max=10)")
+
+    # Pre-load ML models so the first request does not pay the cold-start cost (~500-800ms)
+    with app.app_context():
+        _preload_models()
+
     return app
+
+
+def _preload_models():
+    """Warm up embedding and cross-encoder models inside an app context."""
+    from services.embedding import preload_embedding_model
+    from services.re_ranker import get_cross_encoder
+
+    try:
+        preload_embedding_model()
+        LOGGER.info("Embedding model pre-loaded")
+    except Exception as exc:
+        LOGGER.warning("Failed to pre-load embedding model: %s", exc)
+
+    try:
+        get_cross_encoder()
+        LOGGER.info("Cross-encoder model pre-loaded")
+    except Exception as exc:
+        LOGGER.warning("Failed to pre-load cross-encoder model: %s", exc)
+
+    # Project embeddings are built lazily on first /match-projects call.
+    # Each worker loads from disk if a sibling already computed them (~0.2s),
+    # otherwise computes fresh (~10-20s for 358 short descriptions on CPU).

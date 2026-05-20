@@ -62,7 +62,8 @@ class OpenAIClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
-        tool_choice: Optional[str] = None
+        tool_choice: Optional[str] = None,
+        model: Optional[str] = None
     ) -> Dict[str, Any]:
         """Send a chat completion request to OpenAI.
         
@@ -81,7 +82,7 @@ class OpenAIClient(LLMClient):
         """
         try:
             kwargs = {
-                "model": self.deployment_name,
+                "model": model or self.deployment_name,
                 "messages": messages,
                 "temperature": temperature
             }
@@ -135,6 +136,39 @@ class OpenAIClient(LLMClient):
             logger.error(f"OpenAI chat completion failed: {str(e)}")
             raise
     
+    def chat_completion_stream(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        model: Optional[str] = None
+    ):
+        """Stream a chat completion, yielding text tokens as they arrive.
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'.
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens to generate.
+            model: Optional deployment override (defaults to self.deployment_name).
+
+        Yields:
+            str: Text token chunks as they stream from the API.
+        """
+        kwargs = {
+            "model": model or self.deployment_name,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+
+        logger.info(f"Starting streaming chat completion ({kwargs['model']})")
+        response = self.client.chat.completions.create(**kwargs)
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
     def get_provider_name(self) -> str:
         """Get the provider name."""
         return "openai"

@@ -84,6 +84,22 @@ def clear_cache():
     _memory_cache.clear()
 
 
+def clear_cache_by_prefix(prefix: str) -> int:
+    """Clear all cache entries whose key starts with the given function name prefix.
+
+    Args:
+        prefix: Function name to match (e.g. "get_projects_list")
+
+    Returns:
+        Number of entries removed
+    """
+    global _memory_cache
+    keys_to_remove = [k for k in _memory_cache if k.startswith(prefix)]
+    for k in keys_to_remove:
+        del _memory_cache[k]
+    return len(keys_to_remove)
+
+
 def clear_expired_cache():
     """Clear only expired cache entries."""
     global _memory_cache

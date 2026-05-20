@@ -17,7 +17,6 @@ import ast
 import logging
 import time
 import pandas as pd
-import psycopg
 
 from typing import Any, List, Optional, Tuple, Union
 from datetime import datetime
@@ -68,6 +67,7 @@ class VectorStore:
         predicates: Optional[dict] = None,
         time_range: Optional[Tuple[datetime, datetime]] = None,
         return_dataframe: bool = True,
+        max_per_project: Optional[int] = None,
     ) -> Union[List[Tuple[Any, ...]], pd.DataFrame]:
         """
         Search for documents similar to the query vector using pgvector directly.
@@ -169,14 +169,48 @@ class VectorStore:
         
         # Convert numpy array to Python list for database
         embedding_list = query_embedding[0].tolist()
-        
-        # Prepare parameters in the correct order for the SQL query
-        # Order: embedding (for similarity), WHERE clause params, embedding (for ordering), limit
-        sql_params = [embedding_list] + params + [embedding_list, limit]
-        
-        # Construct the SQL query using cosine distance with pgvector
-        # Note: document_metadata only exists on documents table, not on document_chunks
-        if table_name == "documents":
+
+        # Construct the SQL query using cosine distance with pgvector.
+        # When max_per_project is set and we're filtering by multiple project IDs, use a
+        # window-function CTE to cap results per project before global re-ranking. This
+        # prevents a single high-similarity project from monopolising all result slots.
+        # The CTE approach requires scanning all matching rows (no HNSW shortcut), but for
+        # filtered searches with a known project_ids list this is acceptable — the WHERE
+        # clause already limits the scan to a small fraction of the full table.
+        project_ids_list = (predicates or {}).get("project_ids", [])
+        use_per_project_cap = (
+            max_per_project is not None
+            and max_per_project > 0
+            and table_name != "documents"  # documents table has different schema
+            and len(project_ids_list) > 1
+        )
+
+        if use_per_project_cap:
+            # CTE: rank chunks within each project, then return top N per project globally capped.
+            # Embedding is intentionally omitted from SELECT — it's large (~3KB per row) and not
+            # used downstream; the distance expression only needs it inside the ORDER BY.
+            search_sql = f"""
+            WITH ranked AS (
+                SELECT id, metadata, content,
+                       1 - (embedding <=> %s::vector) AS similarity,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY project_id
+                           ORDER BY embedding <=> %s::vector
+                       ) AS rn
+                FROM {table_name}
+                WHERE {where_clause}
+            )
+            SELECT id, metadata, content, similarity
+            FROM ranked
+            WHERE rn <= %s
+            ORDER BY similarity DESC
+            LIMIT %s
+            """
+            # For CTE: embedding appears twice (similarity calc + ORDER BY inside window), then WHERE params, then max_per_project, then limit
+            sql_params = [embedding_list, embedding_list] + params + [max_per_project, limit]
+            logging.info(f"semantic_search: using per-project CTE (max_per_project={max_per_project}, projects={len(project_ids_list)})")
+        elif table_name == "documents":
+            # Keep embedding for documents table — used by document_similarity_search
             search_sql = f"""
             SELECT id, metadata, content, embedding, document_metadata, 1 - (embedding <=> %s::vector) as similarity
             FROM {table_name}
@@ -184,33 +218,31 @@ class VectorStore:
             ORDER BY embedding <=> %s::vector
             LIMIT %s
             """
+            sql_params = [embedding_list] + params + [embedding_list, limit]
         else:
-            # For document_chunks table, don't select document_metadata
+            # For document_chunks table: omit embedding column to reduce network transfer
             search_sql = f"""
-            SELECT id, metadata, content, embedding, 1 - (embedding <=> %s::vector) as similarity
+            SELECT id, metadata, content, 1 - (embedding <=> %s::vector) as similarity
             FROM {table_name}
             WHERE {where_clause}
             ORDER BY embedding <=> %s::vector
             LIMIT %s
             """
-        
-        # Execute the query using psycopg
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+            sql_params = [embedding_list] + params + [embedding_list, limit]
+
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(search_sql, sql_params)
                 results = cur.fetchall()
-        
+
         elapsed_time = time.time() - start_time
         self._log_search_time("Vector", elapsed_time)
-        
+
         if return_dataframe:
-            # Specify the correct column order for the semantic search results
-            # Note: document_metadata only included when querying documents table
             if table_name == "documents":
                 columns = ["id", "metadata", "content", "embedding", "document_metadata", "similarity"]
             else:
-                columns = ["id", "metadata", "content", "embedding", "similarity"]
+                columns = ["id", "metadata", "content", "similarity"]
             return self._create_dataframe_from_results(results, columns)
         else:
             return results
@@ -263,8 +295,7 @@ class VectorStore:
         LIMIT %s
         """
         doc_params.append(limit)
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(doc_search_sql, doc_params)
                 doc_id_results = cur.fetchall()
@@ -283,7 +314,7 @@ class VectorStore:
                 WHERE document_id IN ({placeholders})
                 ORDER BY document_id DESC
                 """
-                with psycopg.connect(conn_params) as conn:
+                with current_app.db_pool.connection() as conn:
                     with conn.cursor() as cur:
                         cur.execute(fetch_sql, document_ids)
                         results = cur.fetchall()
@@ -331,7 +362,7 @@ class VectorStore:
                 LIMIT %s
                 """
                 chunk_params.append(limit)
-                with psycopg.connect(conn_params) as conn:
+                with current_app.db_pool.connection() as conn:
                     with conn.cursor() as cur:
                         cur.execute(chunk_sql, chunk_params)
                         results = cur.fetchall()
@@ -438,8 +469,7 @@ class VectorStore:
         """
         doc_params.append(limit)
         
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(doc_search_sql, doc_params)
                 doc_id_results = cur.fetchall()
@@ -460,7 +490,7 @@ class VectorStore:
                 WHERE document_id IN ({placeholders})
                 ORDER BY document_id DESC
                 """
-                with psycopg.connect(conn_params) as conn:
+                with current_app.db_pool.connection() as conn:
                     with conn.cursor() as cur:
                         cur.execute(fetch_sql, document_ids)
                         results = cur.fetchall()
@@ -518,7 +548,7 @@ class VectorStore:
                 logging.info(f"VectorStore.keyword_search_with_predicates - Chunk search WHERE clause: {chunk_where_clause}")
                 logging.info(f"VectorStore.keyword_search_with_predicates - Chunk search parameters: {chunk_params}")
                 
-                with psycopg.connect(conn_params) as conn:
+                with current_app.db_pool.connection() as conn:
                     with conn.cursor() as cur:
                         cur.execute(chunk_sql, chunk_params)
                         results = cur.fetchall()
@@ -694,8 +724,7 @@ class VectorStore:
         logging.info(f"VectorStore.document_level_search - Complete parameters list: {params}")
         
         # Execute the query using psycopg
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(search_sql, params)
                 results = cur.fetchall()
@@ -787,8 +816,7 @@ class VectorStore:
         params.append(limit)
         
         # Execute the query using psycopg
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(metadata_sql, params)
                 results = cur.fetchall()
@@ -919,8 +947,7 @@ class VectorStore:
             params = [embedding_list] + document_ids + [embedding_list, limit]
 
         # Execute the query using psycopg
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(search_sql, params)
                 results = cur.fetchall()
@@ -970,8 +997,7 @@ class VectorStore:
         """
         
         # Execute the query using psycopg
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(search_sql, (document_id,))
                 result = cur.fetchone()
@@ -1086,8 +1112,7 @@ class VectorStore:
         params.append(limit)
 
         # Execute query
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(search_sql, params)
                 results = cur.fetchall()
@@ -1193,8 +1218,7 @@ class VectorStore:
         LIMIT 100
         """
 
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(doc_sql, doc_params)
                 doc_results = cur.fetchall()
@@ -1251,7 +1275,7 @@ class VectorStore:
             """
             chunk_params.append(limit)
 
-            with psycopg.connect(conn_params) as conn:
+            with current_app.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(chunk_sql, chunk_params)
                     results = cur.fetchall()
@@ -1363,8 +1387,7 @@ class VectorStore:
         final_params = [embedding_str] + params + [embedding_str, limit]
         
         # Execute the query using psycopg
-        conn_params = current_app.vector_settings.database_url
-        with psycopg.connect(conn_params) as conn:
+        with current_app.db_pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(search_sql, final_params)
                 results = cur.fetchall()

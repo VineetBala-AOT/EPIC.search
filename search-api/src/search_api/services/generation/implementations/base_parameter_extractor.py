@@ -2,14 +2,39 @@
 Base Parameter Extractor Implementation
 Contains common logic for parameter extraction approach.
 """
+import hashlib
 import json
 import logging
+import re as _re
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Any, Union
 
 from search_api.services.generation.abstractions.parameter_extractor import ParameterExtractor
 
 logger = logging.getLogger(__name__)
+
+# Module-level LLM extraction result cache with TTL (avoids redundant LLM calls for repeated queries)
+_extraction_cache: Dict = {}
+_EXTRACTION_CACHE_TTL = 900  # 15 minutes
+
+
+def _make_extraction_cache_key(*parts) -> str:
+    combined = "|".join(str(p) for p in parts)
+    return hashlib.md5(combined.encode()).hexdigest()
+
+
+def _cache_get(key: str):
+    entry = _extraction_cache.get(key)
+    if entry and time.time() - entry[1] < _EXTRACTION_CACHE_TTL:
+        return entry[0]
+    if entry:
+        del _extraction_cache[key]
+    return None
+
+
+def _cache_set(key: str, value) -> None:
+    _extraction_cache[key] = (value, time.time())
 
 class BaseParameterExtractor(ParameterExtractor):
     """Base implementation of parameter extractor with common logic."""
@@ -322,6 +347,7 @@ class BaseParameterExtractor(ParameterExtractor):
                 "project_status": project_status,
                 "years": years,
                 "confidence": 0.8,
+                "embedding_fast_path_used": getattr(self, "_embedding_fast_path_used", False),
                 "extraction_sources": {
                     "project_ids": "supplied" if supplied_project_ids else "llm_parallel",
                     "document_type_ids": "supplied" if supplied_document_type_ids else "llm_combined",
@@ -373,7 +399,58 @@ class BaseParameterExtractor(ParameterExtractor):
             return []
        
         logger.info(f"Available projects for matching: {len(available_projects)} total")
-       
+
+        # Cache check: skip LLM if same query was answered recently
+        _project_count = len(available_projects) if isinstance(available_projects, (list, dict)) else 0
+        _cache_key = _make_extraction_cache_key("project_ids", query.lower().strip(), _project_count)
+        _cached = _cache_get(_cache_key)
+        if _cached is not None:
+            logger.info("🚀 CACHE HIT: project_ids (LLM call skipped)")
+            logger.info("=== PROJECT ID EXTRACTION END ===")
+            return _cached
+
+        # ---------------------------------------------------------------
+        # FAST PATH: embedding-based project matching (~30-80ms vs ~800ms LLM)
+        # High-confidence threshold is intentionally strict to avoid false
+        # positives on generic topic queries (e.g. "fish habitat transmission
+        # lines") that share vocabulary with specific project names.
+        # ---------------------------------------------------------------
+        try:
+            from search_api.clients.vector_search_client import VectorSearchClient
+            emb_matches = VectorSearchClient.match_projects_by_embedding(query, top_k=5, threshold=0.70)
+
+            if emb_matches:
+                # Validate against the known project IDs
+                available_ids = {
+                    p.get("project_id") for p in (available_projects if isinstance(available_projects, list) else [])
+                }
+                if available_ids:
+                    emb_matches = [m for m in emb_matches if m["project_id"] in available_ids]
+
+                top_score = emb_matches[0]["score"] if emb_matches else 0.0
+                second_score = emb_matches[1]["score"] if len(emb_matches) >= 2 else 0.0
+                gap = top_score - second_score
+
+                if emb_matches and top_score >= 0.82 and gap >= 0.12:
+                    # High confidence AND distinctive — skip LLM, return only the top match
+                    result = [emb_matches[0]["project_id"]]
+                    logger.info(f"⚡ EMBEDDING FAST PATH: {result} (top={top_score:.3f}, gap={gap:.3f}) — LLM skipped")
+                    _cache_set(_cache_key, result)
+                    # Signal to extract_parameters that fast-path was used (for dynamic fetch counts)
+                    self._embedding_fast_path_used = True
+                    logger.info("=== PROJECT ID EXTRACTION END ===")
+                    return result
+
+                elif emb_matches and top_score >= 0.75 and gap >= 0.08:
+                    # Medium confidence — narrow project list for LLM (max 5 candidates)
+                    candidate_ids = {m["project_id"] for m in emb_matches[:3]}
+                    if isinstance(available_projects, list):
+                        available_projects = [p for p in available_projects if p.get("project_id") in candidate_ids]
+                    logger.info(f"⚡ EMBEDDING HINTS: reduced project list to {len(available_projects)} candidates (top={top_score:.3f}, gap={gap:.3f})")
+
+        except Exception as _emb_err:
+            logger.warning(f"Embedding fast path error (falling back to LLM): {_emb_err}")
+
         # Try LLM extraction with validation and retry
         for attempt in range(3):  # Maximum 3 attempts
             try:
@@ -396,6 +473,7 @@ class BaseParameterExtractor(ParameterExtractor):
                 if result:
                     logger.info(f"Project extraction successful on attempt {attempt + 1}: {result}")
                     logger.info("=== PROJECT ID EXTRACTION END ===")
+                    _cache_set(_cache_key, result)
                     return result
                 else:
                     logger.warning(f"Project extraction attempt {attempt + 1} failed validation, will retry")
@@ -411,11 +489,30 @@ class BaseParameterExtractor(ParameterExtractor):
         result = self._fallback_project_extraction(query, available_projects)
         logger.info(f"Fallback extraction result: {result}")
         logger.info("=== PROJECT ID EXTRACTION END ===")
+        _cache_set(_cache_key, result)
         return result
    
     def _extract_project_ids_single_attempt(self, query: str, available_projects: List[Dict], attempt: int) -> List[str]:
         """Single attempt at project ID extraction using both project names and selected metadata context."""
         try:
+            # Pre-filter large project lists to keep LLM prompt size manageable
+            _MAX_PROJECTS = 80
+            if len(available_projects) > _MAX_PROJECTS:
+                _query_kws = {w.lower() for w in _re.sub(r'[^\w\s]', '', query).split() if len(w) > 3}
+                if _query_kws:
+                    _scored = [(p, sum(1 for w in _query_kws if w in ' '.join([
+                        p.get('project_name', ''),
+                        (p.get('project_metadata') or {}).get('type', ''),
+                        (p.get('project_metadata') or {}).get('region', ''),
+                        (p.get('project_metadata') or {}).get('description', '')[:150]
+                    ]).lower())) for p in available_projects]
+                    _scored.sort(key=lambda x: x[1], reverse=True)
+                    available_projects = [p for p, _ in _scored[:_MAX_PROJECTS]]
+                    logger.info(f"Pre-filtered projects to {len(available_projects)} for LLM prompt")
+                else:
+                    available_projects = available_projects[:_MAX_PROJECTS]
+                    logger.info(f"Pre-filtered projects to {_MAX_PROJECTS} (capped)")
+
             # ✅ Extract and format relevant fields from metadata for the LLM
             project_lines = []
             for proj in available_projects:
@@ -1079,6 +1176,16 @@ Return ONLY the optimized semantic query (no quotes, no explanation).
         """
         logger.info("=== COMBINED NON-PROJECT EXTRACTION START ===")
 
+        # Cache check: skip LLM if same query+context was answered recently
+        _user_city = (user_location or {}).get('city', '') if user_location else ''
+        _doc_count = len(available_document_types) if available_document_types else 0
+        _cache_key_combined = _make_extraction_cache_key("combined", query.lower().strip(), _doc_count, _user_city)
+        _cached_combined = _cache_get(_cache_key_combined)
+        if _cached_combined is not None:
+            logger.info("🚀 CACHE HIT: combined_params (LLM call skipped)")
+            logger.info("=== COMBINED NON-PROJECT EXTRACTION END ===")
+            return _cached_combined
+
         # Build document type context
         doc_context_lines = []
         if available_document_types:
@@ -1125,7 +1232,8 @@ Return 2-10 key terms.
 === TASK 4: TEMPORAL & LOCATION ===
 - location: Extract geographic references as a string (e.g., "Vancouver, BC", "Peace River region"). Return null if query is about a specific project, not a geographic search.
 - project_status: Extract lifecycle indicators (active, completed, recent, ongoing). Return null if none mentioned.
-- years: Extract specific years or ranges. Map "recently" → last 2-3 years, "this year" → [{current_year}].
+- years: Extract specific document years ONLY when the user explicitly asks for documents from certain years (e.g., "2020 annual report", "reports from 2018 to 2022"). Map "recently" → last 2-3 years, "this year" → [{current_year}].
+  IMPORTANT: For project approval/certification date patterns ("approved after 2010", "certified since 2018", "mines before 2015", "between 2012 and 2020", "last 3 years of approvals"), return years: [] — these refer to project decision dates, NOT document dates, and are handled by a separate filter.
 
 Respond with ONLY this JSON (no explanation):
 {{
@@ -1186,6 +1294,7 @@ Respond with ONLY this JSON (no explanation):
                          f"semantic='{semantic_query}', location={extracted['location']}, "
                          f"status={extracted['project_status']}, years={extracted['years']}")
             logger.info("=== COMBINED NON-PROJECT EXTRACTION END ===")
+            _cache_set(_cache_key_combined, extracted)
             return extracted
 
         except Exception as e:

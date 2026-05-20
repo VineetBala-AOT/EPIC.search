@@ -10,16 +10,64 @@ The service provides:
 
 import json
 import logging
-import psycopg
+import os
+import tempfile
+import threading
+import time
 import uuid
+import numpy as np
 from typing import List, Dict, Any, Optional
 from flask import current_app
 from utils.document_types import (
-    get_all_document_types, 
-    get_document_type, 
+    get_all_document_types,
+    get_document_type,
     get_all_document_type_aliases,
     get_document_type_aliases
 )
+
+# ---------------------------------------------------------------------------
+# Project embedding cache.
+#
+# Per-process in-memory cache (fast lookup after first build).
+# Disk cache at EMBED_CACHE_DIR (default /tmp) lets all Gunicorn workers share
+# the computation — the first worker that finishes saves to disk, the rest load
+# it in <1s instead of recomputing.
+# ---------------------------------------------------------------------------
+_project_emb_cache: Dict[str, Any] = {
+    "embeddings": None,
+    "project_ids": None,
+    "project_names": None,
+    "cache_key": None,
+}
+_emb_cache_lock = threading.Lock()
+_EMBED_CACHE_DIR = os.getenv("EMBED_CACHE_DIR", "/tmp")
+
+
+def _disk_cache_path(cache_key: str) -> str:
+    return os.path.join(_EMBED_CACHE_DIR, f"proj_embeddings_{cache_key}.npz")
+
+
+def _build_project_description(project_name: str, metadata: dict) -> str:
+    """Short, distinctive description for embedding — intentionally excludes long free-text.
+
+    Keeping descriptions short (≈30-50 tokens) is critical: all-mpnet-base-v2 on CPU
+    encodes ~358 short strings in ~10s vs ~3 minutes for 300-char descriptions.
+    """
+    meta = metadata or {}
+    parts = [project_name]
+    if meta.get("type"):
+        parts.append(meta["type"])
+    if meta.get("region"):
+        parts.append(meta["region"])
+    proponent = meta.get("proponent", "")
+    if isinstance(proponent, dict):
+        proponent = proponent.get("name", "")
+    if proponent:
+        parts.append(proponent)
+    if meta.get("sector"):
+        parts.append(meta["sector"])
+    # Deliberately omit meta["description"] — it doubles encoding time per project
+    return " ".join(filter(None, parts))
 
 
 class ToolsService:
@@ -81,10 +129,8 @@ class ToolsService:
             """
             
             logging.info("Executing projects list query")
-            
-            # Execute the query
-            conn_params = current_app.vector_settings.database_url
-            with psycopg.connect(conn_params) as conn:
+
+            with current_app.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(projects_query)
                     results = cur.fetchall()
@@ -123,6 +169,148 @@ class ToolsService:
                 "total_projects": 0,
                 "error": str(e)
             }
+
+    @classmethod
+    def _get_project_embeddings(cls):
+        """Return pre-normalized project embeddings.
+
+        Cache hierarchy (fastest → slowest):
+          1. In-process memory  — zero cost after first build in this worker
+          2. Disk file          — ~0.2s; lets other Gunicorn workers skip computation
+          3. Compute + save     — ~10-20s for 358 short descriptions on CPU
+
+        Returns:
+            (embeddings, project_ids, project_names) — embeddings shape (n, dim), pre-normalized.
+            Returns (None, [], []) on error.
+        """
+        global _project_emb_cache
+
+        projects_data = cls.get_projects_list()
+        projects = projects_data.get("projects", [])
+        if not projects:
+            return None, [], []
+
+        current_ids = tuple(p["project_id"] for p in projects)
+        # Use abs() so the key string is always positive (hash() can be negative)
+        cache_key = str(abs(hash(current_ids)))
+
+        # --- 1. In-process memory check ---
+        with _emb_cache_lock:
+            if _project_emb_cache["cache_key"] == cache_key and _project_emb_cache["embeddings"] is not None:
+                return _project_emb_cache["embeddings"], _project_emb_cache["project_ids"], _project_emb_cache["project_names"]
+
+        # --- 2. Disk cache check ---
+        disk_path = _disk_cache_path(cache_key)
+        if os.path.exists(disk_path):
+            try:
+                data = np.load(disk_path, allow_pickle=True)
+                embeddings = data["embeddings"]
+                project_ids = list(data["project_ids"])
+                project_names = list(data["project_names"])
+                logging.info(f"Loaded project embeddings from disk cache ({embeddings.shape})")
+                with _emb_cache_lock:
+                    _project_emb_cache.update({
+                        "embeddings": embeddings,
+                        "project_ids": project_ids,
+                        "project_names": project_names,
+                        "cache_key": cache_key,
+                    })
+                return embeddings, project_ids, project_names
+            except Exception as exc:
+                logging.warning(f"Disk cache load failed, recomputing: {exc}")
+
+        # --- 3. Compute embeddings ---
+        descriptions, project_ids, project_names = [], [], []
+        for p in projects:
+            meta = p.get("project_metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            descriptions.append(_build_project_description(p["project_name"], meta))
+            project_ids.append(p["project_id"])
+            project_names.append(p["project_name"])
+
+        logging.info(f"Computing embeddings for {len(descriptions)} projects (short descriptions)…")
+        t0 = time.time()
+
+        from services.embedding import get_embedding
+        batch_size = 64
+        batches = [get_embedding(descriptions[i:i + batch_size]) for i in range(0, len(descriptions), batch_size)]
+        embeddings = np.vstack(batches)
+
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        embeddings = embeddings / np.maximum(norms, 1e-10)
+
+        logging.info(f"Project embeddings computed in {time.time() - t0:.1f}s ({embeddings.shape})")
+
+        # Save to disk (atomic write so other workers see a complete file)
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=_EMBED_CACHE_DIR, suffix=".npz")
+            os.close(tmp_fd)
+            np.savez(tmp_path, embeddings=embeddings,
+                     project_ids=np.array(project_ids),
+                     project_names=np.array(project_names))
+            os.replace(tmp_path, disk_path)  # atomic on POSIX
+            logging.info(f"Project embeddings saved to disk: {disk_path}")
+        except Exception as exc:
+            logging.warning(f"Could not save embeddings to disk: {exc}")
+
+        with _emb_cache_lock:
+            _project_emb_cache.update({
+                "embeddings": embeddings,
+                "project_ids": project_ids,
+                "project_names": project_names,
+                "cache_key": cache_key,
+            })
+        return embeddings, project_ids, project_names
+
+    @classmethod
+    def match_projects_by_embedding(cls, query: str, top_k: int = 3, threshold: float = 0.55) -> List[Dict]:
+        """Find the projects most semantically similar to the query.
+
+        Uses the SentenceTransformer already loaded in memory (Phase 1b preloading),
+        so embedding a short query costs ~30ms instead of ~800ms for an LLM call.
+
+        Args:
+            query: User search query.
+            top_k: Maximum number of results.
+            threshold: Minimum cosine similarity to include a result.
+
+        Returns:
+            List of {"project_id", "project_name", "score"} sorted by score descending.
+        """
+        t0 = time.time()
+        try:
+            embeddings, project_ids, project_names = cls._get_project_embeddings()
+            if embeddings is None:
+                return []
+
+            from services.embedding import get_embedding
+            q_emb = get_embedding([query])[0]
+            q_emb = q_emb / max(float(np.linalg.norm(q_emb)), 1e-10)
+
+            scores = embeddings @ q_emb  # cosine similarity, shape (n,)
+
+            results = []
+            for idx in np.argsort(scores)[::-1]:
+                score = float(scores[idx])
+                if score < threshold or len(results) >= top_k:
+                    break
+                results.append({
+                    "project_id": project_ids[idx],
+                    "project_name": project_names[idx],
+                    "score": round(score, 4),
+                })
+
+            top = results[0]["score"] if results else 0.0
+            logging.info(f"Embedding project match: {len(results)} results in {(time.time()-t0)*1000:.0f}ms (top={top:.3f})")
+            return results
+
+        except Exception as exc:
+            logging.error(f"match_projects_by_embedding failed: {exc}")
+            return []
 
     @classmethod
     def get_document_types(cls) -> Dict[str, Any]:
@@ -276,8 +464,7 @@ class ToolsService:
                 VALUES (%s, %s, %s, %s, %s, %s);
             """
 
-            conn_params = current_app.vector_settings.database_url
-            with psycopg.connect(conn_params) as conn:
+            with current_app.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
                         insert_query,
@@ -347,8 +534,7 @@ class ToolsService:
 
             values.append(session_id)
 
-            conn_params = current_app.vector_settings.database_url
-            with psycopg.connect(conn_params) as conn:
+            with current_app.db_pool.connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(update_query, values)
                     if cur.rowcount == 0:

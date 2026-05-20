@@ -16,6 +16,16 @@ from typing import Union, List
 
 _model = None
 
+
+def preload_embedding_model() -> None:
+    """Load the embedding model eagerly so first-request latency is avoided."""
+    global _model
+    if _model is None:
+        from sentence_transformers import SentenceTransformer
+        model_name = current_app.model_settings.embedding_model_name
+        _model = SentenceTransformer(model_name)
+
+
 def get_embedding(texts: Union[str, List[str]]) -> np.ndarray:
     """Generate vector embeddings for the provided text(s).
     

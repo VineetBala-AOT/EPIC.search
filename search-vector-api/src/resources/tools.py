@@ -321,6 +321,40 @@ class ApiCapabilitiesResource(Resource):
             )
 
 
+@API.route("/match-projects", methods=["POST", "OPTIONS"])
+class MatchProjectsResource(Resource):
+    """Fast semantic project matching using pre-computed embeddings."""
+
+    @staticmethod
+    def post():
+        """Find projects matching a query using embedding similarity (replaces LLM project extraction)."""
+        try:
+            data = request.get_json() or {}
+            query = data.get("query", "").strip()
+            top_k = int(data.get("top_k", 3))
+            threshold = float(data.get("threshold", 0.55))
+
+            if not query:
+                return Response(
+                    response=json.dumps({"error": "query is required"}),
+                    status=HTTPStatus.BAD_REQUEST,
+                    mimetype="application/json",
+                )
+
+            matches = ToolsService.match_projects_by_embedding(query, top_k=top_k, threshold=threshold)
+            return Response(
+                response=json.dumps({"matches": matches}),
+                status=HTTPStatus.OK,
+                mimetype="application/json",
+            )
+        except Exception as exc:
+            return Response(
+                response=json.dumps({"error": str(exc)}),
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                mimetype="application/json",
+            )
+
+
 @API.route("/feedback", methods=["POST", "PATCH", "OPTIONS"])
 class Feedback(Resource):
     """Endpoint to create or update search feedback."""

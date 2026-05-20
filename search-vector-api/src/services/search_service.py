@@ -32,7 +32,7 @@ class SearchService:
     """
 
     @classmethod
-    def get_documents_by_query(cls, query: str, project_ids: List[str] = None, document_type_ids: List[str] = None, inference: List[str] = None, min_relevance_score: float = None, top_n: int = None, search_strategy: str = None, semantic_query: str = None) -> Dict[str, Any]:
+    def get_documents_by_query(cls, query: str, project_ids: List[str] = None, document_type_ids: List[str] = None, inference: List[str] = None, min_relevance_score: float = None, top_n: int = None, search_strategy: str = None, semantic_query: str = None, semantic_fetch_count: int = None, keyword_fetch_count: int = None) -> Dict[str, Any]:
         """Retrieve relevant documents using an advanced two-stage search strategy with intelligent project inference.
         
         This method implements a modern search approach that leverages document-level
@@ -274,7 +274,7 @@ class SearchService:
         
         # Track search stage timing
         search_start_time = time.time()
-        documents, search_metrics = search(final_search_query, project_ids, document_type_ids, min_relevance_score, top_n, search_strategy, semantic_query)
+        documents, search_metrics = search(final_search_query, project_ids, document_type_ids, min_relevance_score, top_n, search_strategy, semantic_query, semantic_fetch_count=semantic_fetch_count, keyword_fetch_count=keyword_fetch_count)
         search_time_ms = round((time.time() - search_start_time) * 1000, 2)
         
         # Create comprehensive stage-specific metrics

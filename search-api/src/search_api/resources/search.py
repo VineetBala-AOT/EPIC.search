@@ -15,9 +15,10 @@
 
 from http import HTTPStatus
 from flask_restx import Namespace, Resource
-from flask import Response, current_app, request
+from flask import Response, current_app, request, stream_with_context
 import time
 import json
+import threading
 
 from search_api.clients.vector_search_client import VectorSearchClient
 from search_api.services.search_service import SearchService
@@ -101,19 +102,30 @@ class Search(Resource):
             current_app.logger.info(f"Search results: {len(documents.get('documents', [])) if isinstance(documents, dict) else 'Unknown count'} documents returned")
 
             # ----------------------------
-            # Create feedback session using VectorSearchClient
+            # Create feedback session in a background thread so it never blocks the response.
+            # We do NOT send search_result — that's a multi-MB payload across Azure that was
+            # causing 20-25s delays. Query metadata is enough for feedback tracking.
             # ----------------------------
-            session_id = VectorSearchClient.create_feedback_session(
-                query_text=query,
-                project_ids=project_ids,
-                document_type_ids=document_type_ids,
-                search_result=documents
-            )
-            current_app.logger.info(f"Feedback session created: {session_id}")
+            import uuid
+            session_id = str(uuid.uuid4())
             documents["feedback_session_id"] = session_id
-            
+
+            app = current_app._get_current_object()
+            def _create_session():
+                with app.app_context():
+                    try:
+                        VectorSearchClient.create_feedback_session(
+                            query_text=query,
+                            project_ids=project_ids,
+                            document_type_ids=document_type_ids,
+                        )
+                    except Exception as ex:
+                        app.logger.warning(f"Background feedback session creation failed: {ex}")
+
+            threading.Thread(target=_create_session, daemon=True).start()
+
             current_app.logger.info("=== Search query request completed successfully ===")
-            
+
             return Response(json.dumps(documents), status=HTTPStatus.OK, mimetype='application/json')
         except Exception as e:
             # Log the error internally
@@ -125,6 +137,81 @@ class Search(Resource):
             # Return a generic error message
             error_response = {"error": "Internal server error occurred"}
             return Response(json.dumps(error_response), status=HTTPStatus.INTERNAL_SERVER_ERROR, mimetype='application/json')
+
+
+@cors_preflight("POST, OPTIONS")
+@API.route("/query/stream", methods=["POST", "OPTIONS"])
+class StreamSearch(Resource):
+    """Streaming search endpoint — returns Server-Sent Events so the AI
+    summary appears word-by-word instead of after a long wait.
+
+    SSE event types sent to the client:
+      {"type": "status",  "message": "..."}   — pipeline progress update
+      {"type": "token",   "content": "..."}   — one text token from the LLM
+      {"type": "done",    ...full payload...} — final event (documents, metrics)
+      {"type": "error",   "message": "..."}   — on failure
+    """
+
+    @staticmethod
+    @auth.requires_epic_search_role(["viewer", "admin"])
+    def post():
+        """Streaming search with Server-Sent Events."""
+        from search_api.services.search_handlers.ai_handler import AIHandler
+
+        try:
+            request_data = SearchRequestSchema().load(request.get_json(force=True) or {})
+        except Exception as e:
+            return Response(
+                json.dumps({"error": f"Bad request: {e}"}),
+                status=HTTPStatus.BAD_REQUEST,
+                mimetype="application/json",
+            )
+
+        query = request_data.get("query")
+        if not query:
+            return Response(
+                json.dumps({"error": "Missing required field: query"}),
+                status=HTTPStatus.BAD_REQUEST,
+                mimetype="application/json",
+            )
+
+        project_ids        = request_data.get("projectIds")
+        document_type_ids  = request_data.get("documentTypeIds")
+        inference          = request_data.get("inference")
+        ranking            = request_data.get("ranking")
+        search_strategy    = request_data.get("searchStrategy")
+        user_location      = request_data.get("userLocation")
+        project_status     = request_data.get("projectStatus")
+        years              = request_data.get("years")
+
+        def generate():
+            try:
+                for event in AIHandler.handle_stream(
+                    query=query,
+                    project_ids=project_ids,
+                    document_type_ids=document_type_ids,
+                    search_strategy=search_strategy,
+                    inference=inference,
+                    ranking=ranking,
+                    metrics={},
+                    user_location=user_location,
+                    project_status=project_status,
+                    years=years,
+                ):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except Exception as e:
+                current_app.logger.error(f"Stream generation error: {e}")
+                yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",   # disable nginx buffering
+                "Connection": "keep-alive",
+            },
+        )
 
 
 @cors_preflight("POST, OPTIONS")

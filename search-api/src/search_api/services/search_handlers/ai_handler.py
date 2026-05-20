@@ -3,12 +3,38 @@ AI Handler
 
 Handles AI mode processing - LLM parameter extraction plus AI summarization.
 """
+import hashlib
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Any
+from typing import Dict, Generator, List, Optional, Any
 from flask import current_app
 
 from .base_handler import BaseSearchHandler
+
+# ---------------------------------------------------------------------------
+# Module-level full-response cache — keyed on normalized query, TTL 10 min.
+# Eliminates all LLM + vector search costs for repeated identical queries.
+# ---------------------------------------------------------------------------
+_response_cache: Dict = {}
+_RESPONSE_CACHE_TTL = 600  # seconds
+
+
+def _response_cache_key(query: str) -> str:
+    return hashlib.md5(query.lower().strip().encode()).hexdigest()
+
+
+def _get_cached_response(key: str):
+    entry = _response_cache.get(key)
+    if entry and time.time() - entry[1] < _RESPONSE_CACHE_TTL:
+        return entry[0]
+    if entry:
+        del _response_cache[key]
+    return None
+
+
+def _set_cached_response(key: str, value: Dict) -> None:
+    _response_cache[key] = (value, time.time())
 
 
 class AIHandler(BaseSearchHandler):
@@ -49,6 +75,25 @@ class AIHandler(BaseSearchHandler):
         """
         start_time = time.time()
         current_app.logger.info("=== AI MODE: Starting LLM parameter extraction + AI summarization processing ===")
+
+        # Full-response cache check — skip everything for repeated identical queries
+        # Only applies when no user-supplied overrides are present (pure natural-language queries)
+        _is_pure_query = not any([project_ids, document_type_ids, search_strategy, project_status, years])
+        if _is_pure_query:
+            _cache_key = _response_cache_key(query)
+            _cached = _get_cached_response(_cache_key)
+            if _cached is not None:
+                cache_hit_ms = round((time.time() - start_time) * 1000, 2)
+                current_app.logger.info(f"🚀 RESPONSE CACHE HIT: returning cached result in {cache_hit_ms}ms (all LLM + search skipped)")
+                # Patch timing into the cached response so the client sees cache_hit=True
+                if isinstance(_cached, dict) and "result" in _cached:
+                    cached_metrics = _cached["result"].get("metrics", {})
+                    cached_metrics["timing"] = {
+                        **cached_metrics.get("timing", {}),
+                        "cache_hit": True,
+                        "cache_serve_ms": cache_hit_ms,
+                    }
+                return _cached
 
         # Track if this is an aggregation query (initialized here, set after relevance check)
         is_aggregation_query = False
@@ -258,10 +303,66 @@ class AIHandler(BaseSearchHandler):
                 }
             }
 
+        # Catch project count queries when relevance check failed entirely
+        elif cls._is_project_count_query(query) and available_projects:
+            current_app.logger.info(f"🔍 AI MODE: Relevance check failed but project count query detected ({len(available_projects)} projects)")
+            metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+            metrics["query_type"] = "project_count"
+
+            return {
+                "result": {
+                    "response": cls._generate_project_count_response(available_projects),
+                    "documents": [],
+                    "document_chunks": [],
+                    "metrics": metrics,
+                    "search_quality": "metadata_response",
+                    "project_inference": {},
+                    "document_type_inference": {},
+                    "early_exit": True,
+                    "exit_reason": "project_count_query_fallback",
+                    "query_type": "project_count"
+                }
+            }
+
+        # =====================================================================
+        # SPECULATIVE VECTOR SEARCH — fires in parallel with LLM extraction.
+        # Uses the raw query with no filters and topN=20 so general queries
+        # (where LLM finds no project/doc-type filters) get broader coverage.
+        # Results are reused directly and skip the second vector search entirely.
+        # =====================================================================
+        from search_api.clients.vector_search_client import VectorSearchClient as _VSC
+
+        _speculative: Dict = {}  # filled by background thread
+
+        def _run_speculative():
+            with app.app_context():
+                try:
+                    _d, _c, _r = _VSC.search(
+                        query=query,
+                        ranking={"topN": 20},
+                        search_strategy="HYBRID_PARALLEL",
+                    )
+                    _speculative["docs"] = _d or []
+                    _speculative["chunks"] = _c or []
+                    _speculative["response"] = _r
+                    current_app.logger.info(
+                        f"⚡ SPECULATIVE: finished — {len(_d or [])} docs, {len(_c or [])} chunks"
+                    )
+                except Exception as _e:
+                    current_app.logger.warning(f"⚡ SPECULATIVE: failed — {_e}")
+
+        _speculative_thread = threading.Thread(target=_run_speculative, daemon=True, name="speculative-search")
+        _speculative_thread.start()
+        current_app.logger.info("⚡ SPECULATIVE: search thread launched in parallel with LLM extraction")
+
         # =====================================================================
         # LLM PARAMETER EXTRACTION (metadata already fetched in parallel above)
         # =====================================================================
         current_app.logger.info("🤖 AI MODE: Starting parameter extraction...")
+        # Defensive initialization — keeps variables defined even if the try block
+        # raises before reaching the assignment lines inside it.
+        extraction_result: Dict = {}
+        location = None
         try:
             agentic_start = time.time()
             current_app.logger.info("🤖 LLM: Starting parameter extraction from generation package...")
@@ -271,23 +372,26 @@ class AIHandler(BaseSearchHandler):
             # Name match wins only if it's a strong match (score >= 0.7).
             # Otherwise metadata match wins (handles "mines in lower mainland" type queries).
             early_matched_project_ids = None
+            # Initialize so they're accessible later for the speculative-search recovery guard
+            name_match_id: Optional[str] = None
+            name_match_score: float = 0.0
+            _early_detect_start = time.time()
             if not project_ids and available_projects:
-                # Try both approaches
                 name_match_id, name_match_score = cls._match_project_by_query_text(query, available_projects, return_score=True)
-                metadata_matches = cls._match_projects_by_metadata(query, available_projects)
-
-                if name_match_id and name_match_score >= 0.7:
-                    # Strong name match (e.g., "brucejack" → Brucejack Gold Mine)
+                if name_match_id and name_match_score >= 0.5:
+                    # Any decent name match beats metadata — avoids metadata over-matching
+                    # when the query contains a project name alongside type/location keywords
                     early_matched_project_ids = [name_match_id]
-                    current_app.logger.info(f"🚀 EARLY DETECT: Strong name match (score={name_match_score:.2f}) - using single project")
-                elif metadata_matches:
-                    # Metadata match (e.g., "mines in lower mainland" → all mine-type projects in LM)
-                    early_matched_project_ids = metadata_matches
-                    current_app.logger.info(f"🚀 EARLY DETECT: Metadata match found {len(metadata_matches)} projects by type/region")
-                elif name_match_id:
-                    # Weak name match, but no metadata match - still use it
-                    early_matched_project_ids = [name_match_id]
-                    current_app.logger.info(f"🚀 EARLY DETECT: Weak name match (score={name_match_score:.2f}), no metadata match - using name match")
+                    current_app.logger.info(f"🚀 EARLY DETECT: Name match (score={name_match_score:.2f}) — using single project")
+                else:
+                    metadata_matches = cls._match_projects_by_metadata(query, available_projects)
+                    if metadata_matches:
+                        early_matched_project_ids = metadata_matches
+                        current_app.logger.info(f"🚀 EARLY DETECT: Metadata match found {len(metadata_matches)} projects by type/region")
+                    elif name_match_id:
+                        early_matched_project_ids = [name_match_id]
+                        current_app.logger.info(f"🚀 EARLY DETECT: Weak name match fallback (score={name_match_score:.2f})")
+            metrics["early_detection_ms"] = round((time.time() - _early_detect_start) * 1000, 2)
 
             # Use LLM parameter extractor from generation package
             parameter_extractor = ParameterExtractorFactory.create_extractor()
@@ -307,6 +411,7 @@ class AIHandler(BaseSearchHandler):
             )
 
             # Apply extracted parameters if not already provided
+            _post_llm_start = time.time()
             if not project_ids and extraction_result.get('project_ids'):
                 project_ids = extraction_result['project_ids']
                 current_app.logger.info(f"🤖 LLM: Extracted project IDs: {project_ids}")
@@ -335,6 +440,7 @@ class AIHandler(BaseSearchHandler):
                     if metadata_matches:
                         project_ids = metadata_matches
                         current_app.logger.info(f"🤖 LLM: Metadata match found {len(metadata_matches)} project_ids")
+            metrics["post_llm_processing_ms"] = round((time.time() - _post_llm_start) * 1000, 2)
 
             if not document_type_ids and extraction_result.get('document_type_ids'):
                 document_type_ids = extraction_result['document_type_ids']
@@ -430,21 +536,116 @@ class AIHandler(BaseSearchHandler):
             current_app.logger.info("🎯 AI MODE: Relaxing document type filter to let semantic search find relevant content")
             document_type_ids = None  # Let semantic search find content across all document types
         
-        # Execute vector search with optimized parameters
-        current_app.logger.info("🔍 AI MODE: Executing vector search...")
-        search_result = cls._execute_vector_search(
-            query, project_ids, document_type_ids, inference, ranking, 
-            search_strategy, semantic_query, metrics, 
-            location=final_location,
-            user_location=user_location,
-            project_status=final_project_status, 
-            years=final_years
+        # ── RECOVERY GUARD ───────────────────────────────────────────────────
+        # If the early name-match identified a specific project but project_ids
+        # got cleared (e.g. by type-validation rejecting the LLM's wrong pick
+        # followed by the fallback also failing), restore the name-matched ID
+        # so we never serve unfiltered speculative results for a named-project query.
+        if not project_ids and name_match_id and name_match_score >= 0.5:
+            project_ids = [name_match_id]
+            current_app.logger.info(
+                f"🔒 RECOVER: project_ids was empty but query names a project "
+                f"(score={name_match_score:.2f}); restoring [{name_match_id}] "
+                f"to prevent speculative mismatch"
+            )
+
+        # ── DYNAMIC FETCH COUNTS ─────────────────────────────────────────────
+        # When we're highly confident about a single specific project, reduce the
+        # number of candidates fed to the cross-encoder.  The search is already
+        # scoped to one project's chunks, so 40 candidates is over-fetching.
+        # Halving to 20 cuts reranking time by ~50% with negligible recall loss.
+        _confident_single_project = (
+            project_ids
+            and len(project_ids) == 1
+            and (
+                name_match_score >= 0.80          # very strong text name match
+                or extraction_result.get("embedding_fast_path_used", False)  # embedding fast-path
+            )
         )
+        _reduced_fetch = 20 if _confident_single_project else None
+        if _confident_single_project:
+            current_app.logger.info(
+                f"⚡ DYNAMIC FETCH: single confident project — using fetch_count={_reduced_fetch} "
+                f"(name_score={name_match_score:.2f}, emb_fast={extraction_result.get('embedding_fast_path_used', False)})"
+            )
+        metrics["dynamic_fetch_count"] = _reduced_fetch
+
+        # ── USE SPECULATIVE RESULTS OR RUN REFINED SEARCH ────────────────────
+        # If LLM found no narrowing filters (no project IDs, no doc types,
+        # no location/status/years), the speculative search already ran the
+        # right query.  Reuse its results to skip a second round-trip.
+        # If LLM found specific filters, we must run a targeted search.
+        _has_llm_filters = any([project_ids, document_type_ids, final_location,
+                                 final_project_status, final_years])
+        current_app.logger.info(
+            f"🔎 FILTER CHECK: has_filters={_has_llm_filters} | "
+            f"project_ids={project_ids} | doc_types={document_type_ids} | "
+            f"location={final_location} | status={final_project_status} | years={final_years}"
+        )
+
+        if not _has_llm_filters:
+            # Wait for speculative thread (should already be done by now)
+            _speculative_thread.join(timeout=15)
+            if _speculative.get("docs") or _speculative.get("chunks"):
+                current_app.logger.info("⚡ SPECULATIVE: reusing results — skipping second vector search")
+                metrics["speculative_search_used"] = True
+                # Feed speculative data through the same result-packaging path
+                search_result = cls._execute_vector_search(
+                    query, project_ids, document_type_ids, inference, ranking,
+                    search_strategy, semantic_query, metrics,
+                    location=final_location,
+                    user_location=user_location,
+                    project_status=final_project_status,
+                    years=final_years,
+                    _override_result=(_speculative["docs"], _speculative["chunks"],
+                                      _speculative.get("response", {})),
+                )
+            else:
+                current_app.logger.info("⚡ SPECULATIVE: no results, running full search")
+                metrics["speculative_search_used"] = False
+                search_result = cls._execute_vector_search(
+                    query, project_ids, document_type_ids, inference, ranking,
+                    search_strategy, semantic_query, metrics,
+                    location=final_location, user_location=user_location,
+                    project_status=final_project_status, years=final_years,
+                    semantic_fetch_count=_reduced_fetch, keyword_fetch_count=_reduced_fetch,
+                )
+        else:
+            # Specific query — run refined search with LLM-extracted filters
+            current_app.logger.info("🔍 AI MODE: Running refined vector search with LLM filters...")
+            metrics["speculative_search_used"] = False
+            search_result = cls._execute_vector_search(
+                query, project_ids, document_type_ids, inference, ranking,
+                search_strategy, semantic_query, metrics,
+                location=final_location,
+                user_location=user_location,
+                project_status=final_project_status,
+                years=final_years,
+                semantic_fetch_count=_reduced_fetch, keyword_fetch_count=_reduced_fetch,
+            )
         
         # Check if search returned no results
         if not search_result["documents_or_chunks"]:
             current_app.logger.warning("🔍 AI MODE: No documents found")
-            metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+            total_ms = round((time.time() - start_time) * 1000, 2)
+            metrics["total_time_ms"] = total_ms
+            metrics["timing"] = {
+                "parallel_setup_ms":      metrics.get("parallel_setup_time_ms", 0),
+                "relevance_check_ms":     metrics.get("relevance_check_time_ms", 0),
+                "early_detection_ms":     metrics.get("early_detection_ms", 0),
+                "llm_extraction_ms":      metrics.get("ai_processing_time_ms", 0),
+                "post_llm_processing_ms": metrics.get("post_llm_processing_ms", 0),
+                "vector_search_ms":       metrics.get("search_time_ms", 0),
+                "project_metadata_ms":    0,
+                "summary_generation_ms":  0,
+                "total_ms":               total_ms,
+                "speculative_used":       metrics.get("speculative_search_used", False),
+                "cache_hit":              False,
+            }
+            current_app.logger.info(
+                f"⏱️ TIMING (no results) | llm_extract={metrics['timing']['llm_extraction_ms']}ms | "
+                f"vector_search={metrics['timing']['vector_search_ms']}ms | TOTAL={total_ms}ms"
+            )
             return {
                 "result": {
                     "response": "No relevant information found.",
@@ -459,6 +660,7 @@ class AIHandler(BaseSearchHandler):
         
         # Build project metadata context for the summary
         # This provides project description, status, and other info to the LLM
+        _metadata_lookup_start = time.time()
         matched_project_metadata = None
         try:
             # Determine which projects to look up metadata for
@@ -506,6 +708,7 @@ class AIHandler(BaseSearchHandler):
             current_app.logger.warning(f"🔍 AI MODE: Could not extract project metadata for summary: {e}")
             import traceback
             current_app.logger.warning(f"🔍 AI MODE: Metadata extraction traceback: {traceback.format_exc()}")
+        metrics["project_metadata_lookup_ms"] = round((time.time() - _metadata_lookup_start) * 1000, 2)
 
         # Generate AI summary of search results
         current_app.logger.info("🔍 AI MODE: Generating AI summary...")
@@ -514,7 +717,21 @@ class AIHandler(BaseSearchHandler):
         # Handle summary generation errors
         if isinstance(summary_result, dict) and "error" in summary_result:
             current_app.logger.error("🔍 AI MODE: AI summary generation failed")
-            metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+            total_ms = round((time.time() - start_time) * 1000, 2)
+            metrics["total_time_ms"] = total_ms
+            metrics["timing"] = {
+                "parallel_setup_ms":      metrics.get("parallel_setup_time_ms", 0),
+                "relevance_check_ms":     metrics.get("relevance_check_time_ms", 0),
+                "early_detection_ms":     metrics.get("early_detection_ms", 0),
+                "llm_extraction_ms":      metrics.get("ai_processing_time_ms", 0),
+                "post_llm_processing_ms": metrics.get("post_llm_processing_ms", 0),
+                "vector_search_ms":       metrics.get("search_time_ms", 0),
+                "project_metadata_ms":    metrics.get("project_metadata_lookup_ms", 0),
+                "summary_generation_ms":  metrics.get("llm_time_ms", 0),
+                "total_ms":               total_ms,
+                "speculative_used":       metrics.get("speculative_search_used", False),
+                "cache_hit":              False,
+            }
             return {
                 "result": {
                     "response": summary_result.get("fallback_response", "An error occurred while processing your request."),
@@ -526,13 +743,42 @@ class AIHandler(BaseSearchHandler):
                 }
             }
         
-        # Calculate final metrics
+        # Calculate final metrics and build a structured timing breakdown
         total_time = round((time.time() - start_time) * 1000, 2)
         metrics["total_time_ms"] = total_time
-        
+
+        timing = {
+            "parallel_setup_ms":        metrics.get("parallel_setup_time_ms", 0),
+            "relevance_check_ms":       metrics.get("relevance_check_time_ms", 0),
+            "early_detection_ms":       metrics.get("early_detection_ms", 0),
+            "llm_extraction_ms":        metrics.get("ai_processing_time_ms", 0),
+            "post_llm_processing_ms":   metrics.get("post_llm_processing_ms", 0),
+            "vector_search_ms":         metrics.get("search_time_ms", 0),
+            "project_metadata_ms":      metrics.get("project_metadata_lookup_ms", 0),
+            "summary_generation_ms":    metrics.get("llm_time_ms", 0),
+            "total_ms":                 total_time,
+            "speculative_used":         metrics.get("speculative_search_used", False),
+            "cache_hit":                False,
+        }
+        metrics["timing"] = timing
+
+        # Single-line timing summary in logs (easy to grep / scan)
+        current_app.logger.info(
+            f"⏱️ TIMING | "
+            f"parallel_setup={timing['parallel_setup_ms']}ms | "
+            f"relevance={timing['relevance_check_ms']}ms | "
+            f"early_detect={timing['early_detection_ms']}ms | "
+            f"llm_extract={timing['llm_extraction_ms']}ms | "
+            f"post_llm={timing['post_llm_processing_ms']}ms | "
+            f"vector_search={timing['vector_search_ms']}ms | "
+            f"metadata_lookup={timing['project_metadata_ms']}ms | "
+            f"summary={timing['summary_generation_ms']}ms | "
+            f"TOTAL={total_time}ms"
+        )
+
         # Log summary
         cls._log_agentic_summary(metrics, search_result["search_duration"], search_result["search_quality"], search_result["documents_or_chunks"], query)
-        
+
         current_app.logger.info("=== AI MODE: Processing completed ===")
         
         # Separate documents and document_chunks for consistent API response
@@ -562,7 +808,7 @@ class AIHandler(BaseSearchHandler):
             metrics["chunks_hidden"] = True
             metrics["chunks_hidden_reason"] = "aggregation_summary_query"
 
-        return {
+        final_response = {
             "result": {
                 "response": summary_result.get("response", "No response generated"),
                 "documents": response_documents,
@@ -573,6 +819,332 @@ class AIHandler(BaseSearchHandler):
                 "document_type_inference": search_result["document_type_inference"],
                 "query_type": "aggregation_summary" if is_aggregation_query else "specific_search"
             }
+        }
+
+        # Cache the full response for identical future queries
+        if _is_pure_query:
+            _set_cached_response(_cache_key, final_response)
+
+        return final_response
+
+    # ------------------------------------------------------------------
+    # STREAMING VARIANT
+    # Runs the identical pipeline as handle() but yields SSE event dicts
+    # instead of blocking until the summary is complete.
+    # Protocol:
+    #   {"type": "status",  "message": "..."}   — progress update
+    #   {"type": "token",   "content": "..."}   — one text chunk
+    #   {"type": "done",    ...full payload...} — final event with docs
+    #   {"type": "error",   "message": "..."}   — on failure
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def handle_stream(
+        cls,
+        query: str,
+        project_ids: Optional[List[str]] = None,
+        document_type_ids: Optional[List[str]] = None,
+        search_strategy: Optional[str] = None,
+        inference: Optional[List] = None,
+        ranking: Optional[Dict] = None,
+        metrics: Optional[Dict] = None,
+        user_location: Optional[Dict] = None,
+        project_status: Optional[str] = None,
+        years: Optional[List] = None,
+    ) -> Generator[Dict, None, None]:
+        """Streaming version of handle().  Yields SSE event dicts."""
+        import json as _json
+
+        start_time = time.time()
+        if metrics is None:
+            metrics = {}
+
+        from search_api.services.generation.factories import QueryValidatorFactory, ParameterExtractorFactory
+        from search_api.clients.vector_search_client import VectorSearchClient
+
+        app = current_app._get_current_object()
+
+        # ── Phase 1: parallel setup ───────────────────────────────────────
+        yield {"type": "status", "message": "Checking query relevance and loading metadata…"}
+
+        def _check_relevance():
+            with app.app_context():
+                checker = QueryValidatorFactory.create_validator()
+                return checker.validate_query_relevance(query)
+
+        def _fetch_projects():
+            with app.app_context():
+                return VectorSearchClient.get_projects_list(include_metadata=True)
+
+        def _fetch_doc_types():
+            with app.app_context():
+                return VectorSearchClient.get_document_types()
+
+        def _fetch_strategies():
+            with app.app_context():
+                return VectorSearchClient.get_search_strategies()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            relevance_future = executor.submit(_check_relevance)
+            projects_future = executor.submit(_fetch_projects)
+            doc_types_future = executor.submit(_fetch_doc_types)
+            strategies_future = executor.submit(_fetch_strategies)
+
+        try:
+            relevance_result = relevance_future.result(timeout=30)
+        except Exception:
+            relevance_result = None
+
+        available_projects = []
+        try:
+            available_projects = projects_future.result(timeout=30) or []
+        except Exception:
+            pass
+
+        available_document_types = []
+        try:
+            available_document_types = doc_types_future.result(timeout=30) or []
+        except Exception:
+            pass
+
+        available_strategies = {}
+        try:
+            strategies_data = strategies_future.result(timeout=30)
+            if isinstance(strategies_data, dict):
+                for sk, sd in strategies_data.get("search_strategies", {}).items():
+                    if isinstance(sd, dict) and "name" in sd:
+                        available_strategies[sd["name"]] = sd.get("description", sd["name"])
+        except Exception:
+            pass
+
+        # ── Phase 2: early exits ─────────────────────────────────────────
+        if relevance_result:
+            if not relevance_result.get("is_relevant", True):
+                yield {
+                    "type": "done",
+                    "response": relevance_result.get("suggested_response", "This query is outside EAO scope."),
+                    "documents": [], "document_chunks": [], "metrics": metrics,
+                    "early_exit": True, "exit_reason": "query_not_relevant",
+                }
+                return
+
+            query_type = relevance_result.get("query_type", "specific_search")
+            if query_type != "generic_informational" and cls._is_generic_eao_query(query, available_projects):
+                query_type = "generic_informational"
+
+            if query_type == "generic_informational":
+                yield {
+                    "type": "done",
+                    "response": relevance_result.get("generic_response") or cls._get_default_eao_response(),
+                    "documents": [], "document_chunks": [], "metrics": metrics,
+                    "early_exit": True, "exit_reason": "generic_informational_query",
+                }
+                return
+
+            if query_type == "broad_category_search":
+                category_filter = relevance_result.get("category_filter")
+                broad_result = cls._handle_broad_category_search(
+                    query=query, category_filter=category_filter,
+                    metrics=metrics, start_time=start_time,
+                )
+                yield {"type": "done", **broad_result.get("result", broad_result)}
+                return
+
+            if cls._is_project_count_query(query) and available_projects:
+                yield {
+                    "type": "done",
+                    "response": cls._generate_project_count_response(available_projects),
+                    "documents": [], "document_chunks": [], "metrics": metrics,
+                    "early_exit": True, "exit_reason": "project_count_query",
+                    "query_type": "project_count",
+                }
+                return
+
+        elif cls._is_generic_eao_query(query, available_projects):
+            # Relevance check failed but query is clearly a generic EAO question
+            current_app.logger.info("Stream: relevance check failed but generic EAO query detected")
+            yield {
+                "type": "done",
+                "response": cls._get_default_eao_response(),
+                "documents": [], "document_chunks": [], "metrics": metrics,
+                "early_exit": True, "exit_reason": "generic_informational_fallback",
+            }
+            return
+
+        elif cls._is_project_count_query(query) and available_projects:
+            # Relevance check failed but query is clearly asking about project count
+            current_app.logger.info("Stream: relevance check failed but project count query detected")
+            yield {
+                "type": "done",
+                "response": cls._generate_project_count_response(available_projects),
+                "documents": [], "document_chunks": [], "metrics": metrics,
+                "early_exit": True, "exit_reason": "project_count_query_fallback",
+                "query_type": "project_count",
+            }
+            return
+
+        # ── Phase 3: parameter extraction ────────────────────────────────
+        yield {"type": "status", "message": "Extracting search parameters…"}
+
+        semantic_query = query
+        location = None
+        name_match_id: Optional[str] = None
+        name_match_score: float = 0.0
+        try:
+            early_matched_project_ids = None
+            if not project_ids and available_projects:
+                name_match_id, name_match_score = cls._match_project_by_query_text(query, available_projects, return_score=True)
+                if name_match_id and name_match_score >= 0.5:
+                    early_matched_project_ids = [name_match_id]
+                else:
+                    metadata_matches = cls._match_projects_by_metadata(query, available_projects)
+                    if metadata_matches:
+                        early_matched_project_ids = metadata_matches
+                    elif name_match_id:
+                        early_matched_project_ids = [name_match_id]
+
+            extractor = ParameterExtractorFactory.create_extractor()
+            extraction_result = extractor.extract_parameters(
+                query=query,
+                available_projects=available_projects,
+                available_document_types=available_document_types,
+                available_strategies=available_strategies,
+                supplied_project_ids=project_ids or early_matched_project_ids,
+                supplied_document_type_ids=document_type_ids,
+                supplied_search_strategy=search_strategy,
+                user_location=user_location,
+                supplied_project_status=project_status,
+                supplied_years=years,
+            )
+
+            if not project_ids and extraction_result.get("project_ids"):
+                project_ids = extraction_result["project_ids"]
+                if project_ids and available_projects:
+                    project_ids = cls._validate_projects_against_query_type(query, project_ids, available_projects)
+
+            if not project_ids and available_projects:
+                matched = cls._match_project_by_query_text(query, available_projects)
+                if matched:
+                    project_ids = [matched]
+                else:
+                    meta_matches = cls._match_projects_by_metadata(query, available_projects)
+                    if meta_matches:
+                        project_ids = meta_matches
+
+            if not document_type_ids and extraction_result.get("document_type_ids"):
+                document_type_ids = extraction_result["document_type_ids"]
+            if not search_strategy and extraction_result.get("search_strategy"):
+                search_strategy = extraction_result["search_strategy"]
+            semantic_query = extraction_result.get("semantic_query", query)
+            location = extraction_result.get("location")
+            if not project_status:
+                project_status = extraction_result.get("project_status")
+            if not years:
+                years = extraction_result.get("years")
+
+        except Exception as e:
+            current_app.logger.error(f"Stream: parameter extraction failed: {e}")
+
+        # Recovery guard: if type-validation or an error cleared project_ids but the
+        # query clearly names a project, restore the name-match result.
+        if not project_ids and name_match_id and name_match_score >= 0.5:
+            project_ids = [name_match_id]
+            current_app.logger.info(
+                f"🔒 STREAM RECOVER: restoring project_ids=[{name_match_id}] "
+                f"(name_score={name_match_score:.2f}) to prevent unfiltered speculative results"
+            )
+
+        current_app.logger.info(
+            f"🔎 STREAM FILTER CHECK: project_ids={project_ids} | doc_types={document_type_ids} | "
+            f"location={location} | status={project_status} | years={years}"
+        )
+
+        # ── Phase 4: vector search ────────────────────────────────────────
+        yield {"type": "status", "message": "Searching documents…"}
+
+        search_result = cls._execute_vector_search(
+            query, project_ids, document_type_ids, inference, ranking,
+            search_strategy, semantic_query, metrics,
+            location=location, user_location=user_location,
+            project_status=project_status, years=years,
+        )
+
+        if not search_result["documents_or_chunks"]:
+            yield {
+                "type": "done",
+                "response": "No relevant information found.",
+                "documents": [], "document_chunks": [], "metrics": metrics,
+                "search_quality": search_result["search_quality"],
+            }
+            return
+
+        # ── Phase 5: project metadata for summary context ─────────────────
+        matched_project_metadata = None
+        try:
+            meta_ids = project_ids
+            if not meta_ids and available_projects:
+                matched = cls._match_project_by_query_text(query, available_projects)
+                if matched:
+                    meta_ids = [matched]
+            if meta_ids and available_projects:
+                import json as _json_mod
+                matched_projects_meta = []
+                for proj in available_projects:
+                    if proj.get("project_id") in meta_ids:
+                        proj_meta = proj.get("project_metadata", {})
+                        if isinstance(proj_meta, str):
+                            try:
+                                proj_meta = _json_mod.loads(proj_meta)
+                            except Exception:
+                                proj_meta = {}
+                        if proj_meta:
+                            extracted = cls._extract_metadata_fields(proj, proj_meta)
+                            if extracted:
+                                matched_projects_meta.append(extracted)
+                if matched_projects_meta:
+                    matched_project_metadata = (
+                        matched_projects_meta[0]
+                        if len(matched_projects_meta) == 1
+                        else {"projects": matched_projects_meta}
+                    )
+        except Exception as e:
+            current_app.logger.warning(f"Stream: metadata extraction failed: {e}")
+
+        # ── Phase 6: stream the summary ───────────────────────────────────
+        yield {"type": "status", "message": "Generating summary…"}
+
+        full_response = ""
+        try:
+            for token in cls._generate_agentic_summary_stream(
+                search_result["documents_or_chunks"], query, matched_project_metadata
+            ):
+                full_response += token
+                yield {"type": "token", "content": token}
+        except Exception as e:
+            current_app.logger.error(f"Stream: summary generation failed: {e}")
+            full_response = "An error occurred while generating the summary."
+            yield {"type": "error", "message": str(e)}
+
+        # ── Final event ───────────────────────────────────────────────────
+        metrics["total_time_ms"] = round((time.time() - start_time) * 1000, 2)
+
+        response_documents = []
+        response_document_chunks = []
+        for item in search_result["documents_or_chunks"]:
+            if isinstance(item, dict) and any(f in item for f in ["chunk_text", "chunk_content", "content", "chunk_id"]):
+                response_document_chunks.append(item)
+            else:
+                response_documents.append(item)
+
+        yield {
+            "type": "done",
+            "response": full_response,
+            "documents": response_documents,
+            "document_chunks": response_document_chunks,
+            "metrics": metrics,
+            "search_quality": search_result["search_quality"],
+            "project_inference": search_result["project_inference"],
+            "document_type_inference": search_result["document_type_inference"],
         }
 
     @classmethod
@@ -849,24 +1421,44 @@ For example, you could ask:
             # Take the best of both methods
             total_matches = max(matches, reverse_matches)
 
-            if total_matches == 0:
+            # Method 3: Phrase-level (bigram) matching for compound names like "Site C"
+            # where single-char words are filtered from word-level matching.
+            # "site c" in "site c dam environmental conditions" → large score bonus.
+            proj_name_words = proj_name_lower.split()
+            phrase_bonus = 0.0
+            for i in range(len(proj_name_words) - 1):
+                w1, w2 = proj_name_words[i], proj_name_words[i + 1]
+                bigram = f"{w1} {w2}"
+                # At least one word in the bigram must be non-generic and ≥ 2 chars
+                has_distinctive = (
+                    (w1 not in generic_words and len(w1) >= 2) or
+                    (w2 not in generic_words and len(w2) >= 2)
+                )
+                if has_distinctive and bigram in query_lower:
+                    phrase_bonus = max(phrase_bonus, 0.4)
+                    current_app.logger.info(f"🔍 NAME MATCH: Bigram phrase '{bigram}' found in query for '{proj_name}'")
+
+            if total_matches == 0 and phrase_bonus == 0.0:
                 continue
 
             # Calculate score based on matches
-            score = total_matches / len(distinctive_words)
+            score = (total_matches / len(distinctive_words)) if distinctive_words else 0.0
 
             # Bonus for exact word boundary matches (not just substrings)
             exact_word_matches = len(distinctive_words & query_words)
             if exact_word_matches > 0:
                 score += 0.1 * exact_word_matches
 
+            # Add phrase-level bonus
+            score += phrase_bonus
+
             # Lower threshold to 0.33 to handle projects with multiple distinctive words
             # e.g., "Pretium Brucejack" where only "brucejack" matches
-            if total_matches >= 1 and score > best_score and score >= 0.33:
+            if (total_matches >= 1 or phrase_bonus > 0.0) and score > best_score and score >= 0.33:
                 best_score = score
                 best_match_id = proj.get("project_id")
                 best_match_name = proj_name
-                current_app.logger.info(f"🔍 NAME MATCH: Candidate '{proj_name}' score={score:.2f} (matches={total_matches}, distinctive={len(distinctive_words)})")
+                current_app.logger.info(f"🔍 NAME MATCH: Candidate '{proj_name}' score={score:.2f} (matches={total_matches}, distinctive={len(distinctive_words)}, phrase_bonus={phrase_bonus:.2f})")
 
         if best_match_id:
             current_app.logger.info(f"🔍 NAME MATCH: Best match is '{best_match_name}' with score {best_score:.2f}")
@@ -1371,10 +1963,12 @@ For example, you could ask:
 
         # Find which type the query is asking about
         detected_type = None
+        triggering_term = None
         for type_key, query_terms in type_constraint_mappings.items():
             for term in query_terms:
                 if term in query_lower:
                     detected_type = type_key
+                    triggering_term = term
                     break
             if detected_type:
                 break
@@ -1383,14 +1977,28 @@ For example, you could ask:
             # No type constraint in query, no filtering needed
             return project_ids
 
+        # Build project lookup early so we can check names before filtering
+        proj_lookup = {p.get("project_id"): p for p in available_projects}
+
+        # If the triggering keyword appears in the name of one of the candidate projects,
+        # it's almost certainly a project-name reference (e.g. "woodfibre lng" → "lng"
+        # is part of the Woodfibre LNG project name), not a standalone type constraint
+        # like "lng terminals". Skip type filtering so the correct project is kept.
+        if triggering_term:
+            for pid in project_ids:
+                proj = proj_lookup.get(pid, {})
+                if triggering_term in proj.get("project_name", "").lower():
+                    current_app.logger.info(
+                        f"🔍 TYPE VALIDATE: term '{triggering_term}' is part of project "
+                        f"name '{proj.get('project_name')}' — skipping type constraint filtering"
+                    )
+                    return project_ids
+
         current_app.logger.info(f"🔍 TYPE VALIDATE: Query has type constraint '{detected_type}', validating {len(project_ids)} LLM-extracted projects")
 
         validation_keywords = type_validation_keywords.get(detected_type, [])
         if not validation_keywords:
             return project_ids
-
-        # Build a lookup of project_id → project data
-        proj_lookup = {p.get("project_id"): p for p in available_projects}
 
         valid_ids = []
         rejected_ids = []
@@ -1667,6 +2275,245 @@ For example, you could ask:
             f"You can ask about specific project types (e.g., \"mining projects in BC\") "
             f"or a specific project by name for more details."
         )
+
+    @classmethod
+    def _is_typed_project_count_query(cls, query: str) -> Optional[str]:
+        """Detect queries asking for a count/list of a specific project type.
+
+        Examples:
+          "how many projects are mines" → "Mines"
+          "how many mines does eao have" → "Mines"
+          "how many lng projects" → "Energy-Electricity"
+          "how many water management projects" → "Water Management"
+
+        Returns:
+            A metadata type string to filter by, or None if not a typed count query.
+        """
+        query_lower = query.lower().strip()
+
+        # Must look like a count/list request
+        count_triggers = [
+            "how many", "number of", "count of", "total number",
+            "list of", "list all", "show all", "what are all",
+        ]
+        if not any(t in query_lower for t in count_triggers):
+            return None
+
+        # Map query keywords to metadata type values (as stored in project_metadata.type)
+        type_map = [
+            (["mine", "mines", "mining", "mineral"], "Mines"),
+            (["lng", "liquefied natural gas", "natural gas"], "Energy-Electricity"),
+            (["pipeline"], "Energy-Electricity"),
+            (["hydroelectric", "hydro", "dam", "reservoir"], "Water Management"),
+            (["wind", "solar", "renewable", "clean energy"], "Energy-Electricity"),
+            (["water", "water management", "flood"], "Water Management"),
+            (["highway", "road", "transportation", "railway", "rail", "bridge"], "Transportation"),
+            (["resort", "ski", "tourism"], "Tourism"),
+            (["waste", "landfill", "hazardous"], "Waste Disposal"),
+            (["port", "marine terminal", "terminal"], "Industrial"),
+            (["transmission", "power line"], "Energy-Electricity"),
+        ]
+
+        for keywords, type_value in type_map:
+            if any(kw in query_lower for kw in keywords):
+                return type_value
+
+        return None
+
+    @classmethod
+    def _generate_typed_count_response(cls, available_projects: List[Dict], project_type: str) -> str:
+        """Generate a count/list response for a specific project type from metadata.
+
+        Args:
+            available_projects: List of project dicts with metadata
+            project_type: The metadata type to filter by (e.g., "Mines")
+
+        Returns:
+            Formatted response string with count and project names
+        """
+        matching = []
+        for proj in available_projects:
+            proj_meta = proj.get("project_metadata", {}) or {}
+            if isinstance(proj_meta, str):
+                try:
+                    import json as _j
+                    proj_meta = _j.loads(proj_meta)
+                except Exception:
+                    proj_meta = {}
+            ptype = proj_meta.get("type", "") if isinstance(proj_meta, dict) else ""
+            if ptype and ptype.lower() == project_type.lower():
+                matching.append(proj.get("project_name", "Unknown"))
+
+        count = len(matching)
+        if count == 0:
+            return (
+                f"There are no projects classified as **{project_type}** in the EAO database. "
+                f"Project types may be stored under a different category name. "
+                f"Ask 'how many projects are there?' to see all available types."
+            )
+
+        matching_sorted = sorted(matching)
+        if count <= 20:
+            project_list = "\n".join(f"- {name}" for name in matching_sorted)
+            return (
+                f"There are **{count} {project_type} projects** in the EAO database:\n\n"
+                f"{project_list}\n\n"
+                f"You can ask about any of these projects for more details, conditions, or documents."
+            )
+        else:
+            sample = "\n".join(f"- {name}" for name in matching_sorted[:15])
+            return (
+                f"There are **{count} {project_type} projects** in the EAO database. "
+                f"Here is a sample of 15:\n\n"
+                f"{sample}\n\n"
+                f"... and {count - 15} more. Ask about a specific project by name for details."
+            )
+
+    @classmethod
+    def _is_metadata_fact_query(cls, query: str) -> Optional[str]:
+        """Detect if query is asking for a specific fact available in project metadata.
+
+        Examples:
+          "who is the proponent for Site C" → 'proponent'
+          "what phase is Coastal GasLink in" → 'phase'
+          "what is the status of Brucejack" → 'status'
+          "when was Site C approved" → 'decision'
+          "where is the Brucejack project" → 'location'
+
+        Returns:
+            Fact type string ('proponent', 'phase', 'status', 'decision', 'location'),
+            or None if not a metadata fact query.
+        """
+        query_lower = query.lower().strip()
+
+        fact_patterns = {
+            'proponent': [
+                'who is the proponent', 'what is the proponent', 'who is proponent',
+                'proponent of', 'proponent for', 'who built', 'who is building',
+                'who developed', 'who is developing', 'who owns the project',
+                'developer of',
+            ],
+            'phase': [
+                'what phase is', 'what is the phase', 'what phase are they in',
+                'current phase of', 'what phase', 'which phase',
+            ],
+            'status': [
+                'what is the status', 'what is the current status', 'status of',
+                'what is the state of', 'current status of', 'what is their status',
+            ],
+            'decision': [
+                'what was the decision', 'what is the decision', 'was it approved',
+                'was the certificate issued', 'eac decision', 'assessment decision',
+                'when was it approved', 'when was the certificate', 'when was',
+                'decision for', 'approved or rejected', 'certificate issued',
+            ],
+            'location': [
+                'where is the project', 'where is it located', 'location of the project',
+                'where is the', 'where does', 'what region is',
+            ],
+        }
+
+        for fact_type, patterns in fact_patterns.items():
+            if any(p in query_lower for p in patterns):
+                return fact_type
+
+        return None
+
+    @classmethod
+    def _answer_metadata_fact(cls, query: str, fact_type: str, available_projects: List[Dict]) -> Optional[str]:
+        """Answer a metadata fact query directly from project metadata without vector search.
+
+        Args:
+            query: The user's query text
+            fact_type: The type of fact to answer ('proponent', 'phase', 'status', 'decision', 'location')
+            available_projects: List of project dicts with metadata
+
+        Returns:
+            Formatted answer string, or None if the project can't be identified
+        """
+        if not available_projects:
+            return None
+
+        # Find the project being asked about
+        project_id, score = cls._match_project_by_query_text(query, available_projects, return_score=True)
+        if not project_id or score < 0.3:
+            return None
+
+        proj = next((p for p in available_projects if p.get('project_id') == project_id), None)
+        if not proj:
+            return None
+
+        proj_name = proj.get('project_name', 'Unknown Project')
+        proj_meta = proj.get('project_metadata', {}) or {}
+        if isinstance(proj_meta, str):
+            try:
+                import json as _j
+                proj_meta = _j.loads(proj_meta)
+            except Exception:
+                proj_meta = {}
+
+        meta = cls._extract_metadata_fields(proj, proj_meta)
+        if not meta:
+            return None
+
+        if fact_type == 'proponent':
+            proponent = meta.get('proponent')
+            if proponent:
+                return (
+                    f"The proponent for the **{proj_name}** project is **{proponent}**.\n\n"
+                    f"You can ask about specific documents, conditions, or environmental impacts "
+                    f"for this project for more details."
+                )
+
+        elif fact_type == 'phase':
+            phase = meta.get('status')  # 'status' = currentPhaseName.name
+            ea_status = meta.get('ea_status')
+            if phase or ea_status:
+                answer = f"**{proj_name}** project phase/status:\n\n"
+                if phase:
+                    answer += f"- Current Phase: **{phase}**\n"
+                if ea_status:
+                    answer += f"- EA Status: **{ea_status}**\n"
+                answer += "\nFor detailed phase documentation, ask about assessment reports or working group reports for this project."
+                return answer
+
+        elif fact_type == 'status':
+            ea_status = meta.get('ea_status')
+            phase = meta.get('status')
+            if ea_status or phase:
+                answer = f"**{proj_name}** current status:\n\n"
+                if ea_status:
+                    answer += f"- EA Status: **{ea_status}**\n"
+                if phase:
+                    answer += f"- Current Phase: **{phase}**\n"
+                answer += "\nFor detailed status reports or compliance documents, ask about specific document types for this project."
+                return answer
+
+        elif fact_type == 'decision':
+            decision = meta.get('ea_decision')
+            decision_date = meta.get('decision_date')
+            if decision or decision_date:
+                answer = f"**{proj_name}** EA decision:\n\n"
+                if decision:
+                    answer += f"- Decision: **{decision}**\n"
+                if decision_date:
+                    answer += f"- Decision Date: **{decision_date}**\n"
+                answer += "\nFor full certificate conditions, ask for Schedule B documents for this project."
+                return answer
+
+        elif fact_type == 'location':
+            location = meta.get('location') or meta.get('region')
+            region = meta.get('region')
+            if location or region:
+                answer = f"**{proj_name}** location:\n\n"
+                if location:
+                    answer += f"- Location: **{location}**\n"
+                if region and region != location:
+                    answer += f"- Region: **{region}**\n"
+                answer += "\nFor environmental conditions related to this location, ask about assessment reports or Schedule B documents."
+                return answer
+
+        return None
 
     @classmethod
     def _extract_metadata_fields(cls, proj: Dict, proj_meta: Dict) -> Optional[Dict]:

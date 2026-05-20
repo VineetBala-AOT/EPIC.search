@@ -137,6 +137,38 @@ def create_app(run_mode=os.getenv("FLASK_ENV", "development")):
 def build_cache(app):
     """Build cache."""
     cache.init_app(app)
+    _prewarm_metadata_cache(app)
+
+
+def _prewarm_metadata_cache(app):
+    """Fetch projects, doc-types, and strategies in the background at startup.
+
+    The first real user query pays no metadata-fetch cost because the 24-hour
+    TTL cache is already populated by the time anyone types a search.
+    """
+    import threading
+    from search_api.clients.vector_search_client import VectorSearchClient
+
+    def _warm():
+        with app.app_context():
+            try:
+                projects = VectorSearchClient.get_projects_list(include_metadata=True)
+                app.logger.info(f"[prewarm] projects loaded: {len(projects or [])}")
+            except Exception as e:
+                app.logger.warning(f"[prewarm] projects fetch failed: {e}")
+            try:
+                doc_types = VectorSearchClient.get_document_types()
+                app.logger.info(f"[prewarm] document types loaded: {len(doc_types or [])}")
+            except Exception as e:
+                app.logger.warning(f"[prewarm] doc-types fetch failed: {e}")
+            try:
+                VectorSearchClient.get_search_strategies()
+                app.logger.info("[prewarm] search strategies loaded")
+            except Exception as e:
+                app.logger.warning(f"[prewarm] strategies fetch failed: {e}")
+
+    thread = threading.Thread(target=_warm, daemon=True, name="cache-prewarm")
+    thread.start()
 
 
 def setup_jwt_manager(app_context, jwt_manager):

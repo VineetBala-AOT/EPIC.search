@@ -1344,7 +1344,11 @@ LOCATION QUERY STRATEGY:
             List of search query variations
         """
         variations = [base_query]  # Always include the base query
-        
+
+        # No LLM needed when only the base query is requested
+        if num_variations <= 1:
+            return variations
+
         # Generate additional variations based on the base query
         try:
             if self.llm_client:
@@ -2715,7 +2719,141 @@ Example usage: "document_type_ids": ["{result_data[0]['document_type_id'] if res
         }
 
 
-def handle_agent_query(query: str, reason: str, llm_client=None, user_location: Optional[Dict[str, Any]] = None, 
+def _filter_projects_by_decision_year(available_projects: list, query: str):
+    """Return project IDs whose decisionDate falls within the temporal range stated in the query.
+
+    Handles patterns:
+      "after YYYY" / "since YYYY"           → year_from = YYYY
+      "before YYYY"                          → year_to   = YYYY
+      "between YYYY and YYYY"                → year_from, year_to
+      "from YYYY to YYYY"                    → year_from, year_to
+      "approved/certified/issued in YYYY"    → exact year
+      "last N years" / "past N years"        → year_from = current_year - N
+      "recent" / "recently" / "last year"   → year_from = current_year - 3
+
+    Returns None  → no temporal pattern detected; caller should NOT filter.
+    Returns list  → project IDs matching the range (empty list treated as None by caller).
+    """
+    import re
+    from datetime import datetime
+
+    current_year = datetime.now().year
+    q = query.lower()
+    year_from = None
+    year_to = None
+
+    # ── Explicit year patterns ────────────────────────────────────────────────
+    m = re.search(r'\b(?:after|since)\s+(\d{4})\b', q)
+    if m:
+        year_from = int(m.group(1))
+
+    m = re.search(r'\bbefore\s+(\d{4})\b', q)
+    if m:
+        year_to = int(m.group(1))
+
+    m = re.search(r'\bbetween\s+(\d{4})\s+and\s+(\d{4})\b', q)
+    if m:
+        year_from, year_to = int(m.group(1)), int(m.group(2))
+
+    m = re.search(r'\bfrom\s+(\d{4})\s+to\s+(\d{4})\b', q)
+    if m:
+        year_from, year_to = int(m.group(1)), int(m.group(2))
+
+    if year_from is None and year_to is None:
+        m = re.search(r'\b(?:approved|certified|certificate|issued|completed)\s+in\s+(\d{4})\b', q)
+        if m:
+            year_from = year_to = int(m.group(1))
+
+    # ── Relative time patterns ────────────────────────────────────────────────
+    if year_from is None and year_to is None:
+        m = re.search(r'\b(?:last|past)\s+(\d+)\s+years?\b', q)
+        if m:
+            year_from = current_year - int(m.group(1))
+
+    if year_from is None and year_to is None:
+        if re.search(r'\b(?:recent|recently|latest|last\s+year|past\s+year)\b', q):
+            year_from = current_year - 3
+
+    if year_from is None and year_to is None:
+        logger.info("🗓️ DECISION DATE FILTER: no temporal pattern detected — skipping")
+        return None
+
+    logger.info(f"🗓️ DECISION DATE FILTER: detected year_from={year_from} year_to={year_to} from query")
+
+    # ── Diagnostic: sample the first project to verify metadata structure ─────
+    if available_projects:
+        sample = available_projects[0]
+        sample_meta = sample.get('project_metadata') or {}
+        sample_keys = list(sample_meta.keys())[:10] if isinstance(sample_meta, dict) else type(sample_meta).__name__
+        projects_with_date = sum(
+            1 for p in available_projects
+            if isinstance(p.get('project_metadata'), dict)
+            and (p['project_metadata'].get('decisionDate') or p['project_metadata'].get('decision_date'))
+        )
+        logger.info(
+            f"🗓️ DECISION DATE FILTER: {len(available_projects)} total projects, "
+            f"{projects_with_date} have decisionDate. "
+            f"Sample metadata keys: {sample_keys}"
+        )
+
+    # ── Filter ────────────────────────────────────────────────────────────────
+    matched_ids = []
+    for proj in (available_projects or []):
+        if not isinstance(proj, dict):
+            continue
+        meta = proj.get('project_metadata') or {}
+        if not isinstance(meta, dict):
+            continue
+        raw_date = meta.get('decisionDate') or meta.get('decision_date') or ''
+        if not raw_date:
+            continue
+        try:
+            decision_year = int(str(raw_date)[:4])
+        except (ValueError, TypeError):
+            continue
+        if year_from is not None and decision_year < year_from:
+            continue
+        if year_to is not None and decision_year > year_to:
+            continue
+        pid = proj.get('project_id')
+        if pid:
+            matched_ids.append(pid)
+
+    logger.info(
+        f"🗓️ DECISION DATE FILTER: {len(matched_ids)} projects match "
+        f"year_from={year_from} year_to={year_to} → "
+        f"{matched_ids[:5]}{'...' if len(matched_ids) > 5 else ''}"
+    )
+    return matched_ids if matched_ids else None
+
+
+def _strip_temporal_phrase(semantic_query: str) -> str:
+    """Remove project-approval temporal phrases from the semantic query.
+
+    When _filter_projects_by_decision_year scopes the search to approved projects,
+    the semantic query should focus on document content, not the approval date.
+    Leaving "after 2010" in the query degrades vector match quality.
+    """
+    import re
+    q = semantic_query
+
+    patterns = [
+        r'\b(?:approved|certified|certificate|issued|completed)\s+(?:after|since|before|in)\s+\d{4}\b',
+        r'\b(?:after|since)\s+\d{4}\b',
+        r'\bbefore\s+\d{4}\b',
+        r'\bbetween\s+\d{4}\s+and\s+\d{4}\b',
+        r'\bfrom\s+\d{4}\s+to\s+\d{4}\b',
+        r'\b(?:last|past)\s+\d+\s+years?\b',
+        r'\b(?:recent|recently|latest)\b',
+    ]
+    for pat in patterns:
+        q = re.sub(pat, '', q, flags=re.IGNORECASE)
+
+    q = re.sub(r'\s{2,}', ' ', q).strip()
+    return q if q else semantic_query
+
+
+def handle_agent_query(query: str, reason: str, llm_client=None, user_location: Optional[Dict[str, Any]] = None,
                       project_ids: Optional[List[str]] = None, document_type_ids: Optional[List[str]] = None, 
                       search_strategy: Optional[str] = None, ranking: Optional[Dict[str, Any]] = None,
                       project_status: Optional[str] = None, 
@@ -2759,14 +2897,128 @@ def handle_agent_query(query: str, reason: str, llm_client=None, user_location: 
     
     logger.info("=" * 60)
     
+    # Per-step timing accumulators (ms)
+    _step_timings = {
+        "relevance_check_ms": 0,
+        "parameter_extraction_ms": 0,
+        "vector_search_ms": 0,
+        "consolidation_ms": 0,
+        "summary_generation_ms": 0,
+    }
+    # Flat method-level call trace
+    _trace = []
+
+    def _t_entry(method, module, duration_ms, detail="", is_external=False):
+        _trace.append({
+            "method": method,
+            "module": module,
+            "duration_ms": round(duration_ms, 2),
+            "detail": detail,
+            "is_external": is_external,
+        })
+
     try:
-        # STEP 1: Validate Query Relevance
-        logger.info("🔍 STEP 1: Validating query relevance...")
-        from search_api.services.generation.factories import QueryValidatorFactory
-        relevance_checker = QueryValidatorFactory.create_validator()
-        relevance_result = relevance_checker.validate_query_relevance(query)
-        
-        if not relevance_result.get("is_relevant", True):
+        # STEPS 1 + 2a/2b run in parallel:
+        #   - Step 1: LLM relevance check (skippable via DISABLE_RELEVANCE_CHECK=true)
+        #   - Step 2a: Fetch projects list (cached 24h after first call)
+        #   - Step 2b: Fetch document types (cached 24h after first call)
+        # Running them concurrently saves ~1s on warm instances (relevance check latency).
+
+        from search_api.services.generation.factories import ParameterExtractorFactory, QueryValidatorFactory
+        from search_api.clients.vector_search_client import VectorSearchClient
+
+        disable_relevance = os.getenv("DISABLE_RELEVANCE_CHECK", "false").lower() == "true"
+
+        # Fast heuristic: skip LLM relevance check when query is obviously EAO-related.
+        # Saves 3-4s per query when the relevance check would always pass anyway.
+        # Triggers if: user already filtered by project, OR query contains EAO/project/doc terms.
+        if not disable_relevance and project_ids:
+            disable_relevance = True
+            logger.info("⚡ RELEVANCE CHECK SKIPPED: frontend supplied project_ids → obviously relevant")
+        elif not disable_relevance:
+            _q_lower = query.lower()
+            _eao_keywords = {
+                "eao", "environmental assessment", "certificate", "schedule b", "schedule a",
+                "conditions", "proponent", "compliance", "amendment", "assessment report",
+                "working group", "mine", "mines", "mining", "pipeline", "lng", "hydroelectric",
+                "transmission line", "dam", "reservoir", "highway", "port", "terminal",
+                "application", "effects assessment", "ea certificate",
+            }
+            if any(kw in _q_lower for kw in _eao_keywords):
+                disable_relevance = True
+                logger.info("⚡ RELEVANCE CHECK SKIPPED: query contains obvious EAO/project keywords")
+
+        available_projects = {}
+        available_document_types = {}
+        relevance_result = {"is_relevant": True}
+        _proj_ms = 0.0
+        _dt_ms = 0.0
+
+        app = current_app._get_current_object()
+
+        def _fetch_projects():
+            with app.app_context():
+                _t0 = time.time()
+                data = VectorSearchClient.get_projects_list(include_metadata=True)
+                return data, round((time.time() - _t0) * 1000, 2)
+
+        def _fetch_doc_types():
+            with app.app_context():
+                _t0 = time.time()
+                data = VectorSearchClient.get_document_types()
+                return data, round((time.time() - _t0) * 1000, 2)
+
+        def _check_relevance():
+            with app.app_context():
+                _t0 = time.time()
+                checker = QueryValidatorFactory.create_validator()
+                result = checker.validate_query_relevance(query)
+                return result, round((time.time() - _t0) * 1000, 2)
+
+        tasks = {"projects": _fetch_projects, "doc_types": _fetch_doc_types}
+        if not disable_relevance:
+            tasks["relevance"] = _check_relevance
+
+        logger.info(f"🔍 STEP 1+2: Running {list(tasks.keys())} in parallel (DISABLE_RELEVANCE_CHECK={disable_relevance})")
+
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            futures = {name: executor.submit(fn) for name, fn in tasks.items()}
+            for name, future in futures.items():
+                try:
+                    if name == "projects":
+                        available_projects, _proj_ms = future.result()
+                        _t_entry(
+                            "VectorSearchClient.get_projects_list(include_metadata=True)",
+                            "VectorSearchClient → GET /tools/projects",
+                            _proj_ms,
+                            f"Fetched {len(available_projects) if available_projects else 0} projects (cached after first call)",
+                            is_external=True,
+                        )
+                    elif name == "doc_types":
+                        available_document_types, _dt_ms = future.result()
+                        _t_entry(
+                            "VectorSearchClient.get_document_types()",
+                            "VectorSearchClient → GET /tools/document-types",
+                            _dt_ms,
+                            f"Fetched {len(available_document_types) if available_document_types else 0} document types (cached after first call)",
+                            is_external=True,
+                        )
+                    elif name == "relevance":
+                        relevance_result, _rel_ms = future.result()
+                        _step_timings["relevance_check_ms"] = _rel_ms
+                        _t_entry(
+                            "validate_query_relevance(query)",
+                            "QueryValidator (LLM call)",
+                            _rel_ms,
+                            f"Result: {'relevant ✓' if relevance_result.get('is_relevant', True) else 'not relevant — early exit'}",
+                        )
+                except Exception as e:
+                    logger.warning(f"🔍 Parallel task '{name}' failed: {e}")
+
+        if disable_relevance:
+            logger.info("🔍 STEP 1: Relevance check SKIPPED (DISABLE_RELEVANCE_CHECK=true)")
+            _t_entry("validate_query_relevance(query)", "QueryValidator", 0, "SKIPPED via DISABLE_RELEVANCE_CHECK")
+        elif not relevance_result.get("is_relevant", True):
             logger.info("🔍 AGENT: Query not relevant to EAO - returning early")
             return {
                 "agent_results": [],
@@ -2775,55 +3027,237 @@ def handle_agent_query(query: str, reason: str, llm_client=None, user_location: 
                 "steps_executed": 1,
                 "consolidated_summary": relevance_result.get("response", "This query appears to be outside the scope of EAO's mandate."),
                 "early_exit": True,
-                "exit_reason": "query_not_relevant"
+                "exit_reason": "query_not_relevant",
+                "step_timings": _step_timings,
+                "trace": _trace,
             }
-        
-        logger.info(f"🔍 STEP 1: Query is relevant - continuing")
-        
-        # STEP 2: Extract Parameters using Base Parameter Extractor  
-        logger.info("🤖 STEP 2: Extracting parameters...")
-        from search_api.services.generation.factories import ParameterExtractorFactory
-        from search_api.clients.vector_search_client import VectorSearchClient
-        
-        # Get available data for parameter extraction
-        try:
-            # Get data arrays directly from VectorSearchClient (no conversion needed)
-            available_projects = VectorSearchClient.get_projects_list(include_metadata=True)
-            available_document_types = VectorSearchClient.get_document_types()
-            available_strategies = VectorSearchClient.get_search_strategies()
-            
-            logger.info(f"🤖 STEP 2: Got {len(available_projects) if available_projects else 0} projects, {len(available_document_types) if available_document_types else 0} document types")
-        except Exception as e:
-            logger.warning(f"🤖 STEP 2: Could not fetch available data: {e}")
-            available_projects = {}
-            available_document_types = {}
-            available_strategies = {}
-        
+        else:
+            logger.info(f"🔍 STEP 1: Query is relevant - continuing ({_step_timings['relevance_check_ms']}ms)")
+
+        logger.info(f"🤖 STEP 2: Got {len(available_projects) if available_projects else 0} projects, {len(available_document_types) if available_document_types else 0} document types")
+
+        # ── Early exits for generic informational queries ─────────────────────
+        # These queries don't benefit from vector search — answer them directly.
+        from search_api.services.search_handlers.ai_handler import AIHandler as _AIH
+
+        if _AIH._is_generic_eao_query(query, available_projects):
+            logger.info("🔍 AGENT: Generic EAO query — returning overview response (no vector search needed)")
+            return {
+                "agent_results": [],
+                "planning_method": "Early exit - generic EAO informational query",
+                "execution_time": round((time.time() - start_time) * 1000, 2),
+                "steps_executed": 1,
+                "consolidated_summary": _AIH._get_default_eao_response(),
+                "early_exit": True,
+                "exit_reason": "generic_informational",
+                "step_timings": _step_timings,
+                "trace": _trace,
+            }
+
+        if _AIH._is_project_count_query(query) and available_projects:
+            logger.info("🔍 AGENT: Project count query — returning metadata response (no vector search needed)")
+            return {
+                "agent_results": [],
+                "planning_method": "Early exit - project count query",
+                "execution_time": round((time.time() - start_time) * 1000, 2),
+                "steps_executed": 1,
+                "consolidated_summary": _AIH._generate_project_count_response(available_projects),
+                "early_exit": True,
+                "exit_reason": "project_count_query",
+                "step_timings": _step_timings,
+                "trace": _trace,
+            }
+
+        # Typed count: "how many mines", "how many lng projects", etc.
+        _typed_count_type = _AIH._is_typed_project_count_query(query)
+        if _typed_count_type and available_projects:
+            logger.info(f"🔍 AGENT: Typed count query (type='{_typed_count_type}') — returning metadata response")
+            return {
+                "agent_results": [],
+                "planning_method": f"Early exit - typed count query ({_typed_count_type})",
+                "execution_time": round((time.time() - start_time) * 1000, 2),
+                "steps_executed": 1,
+                "consolidated_summary": _AIH._generate_typed_count_response(available_projects, _typed_count_type),
+                "early_exit": True,
+                "exit_reason": "typed_count_query",
+                "step_timings": _step_timings,
+                "trace": _trace,
+            }
+
+        # Metadata fact: "who is the proponent for X?", "what phase is X in?", etc.
+        _fact_type = _AIH._is_metadata_fact_query(query)
+        if _fact_type and available_projects:
+            _fact_answer = _AIH._answer_metadata_fact(query, _fact_type, available_projects)
+            if _fact_answer:
+                logger.info(f"🔍 AGENT: Metadata fact query (type='{_fact_type}') — answering from project metadata")
+                return {
+                    "agent_results": [],
+                    "planning_method": f"Early exit - metadata fact query ({_fact_type})",
+                    "execution_time": round((time.time() - start_time) * 1000, 2),
+                    "steps_executed": 1,
+                    "consolidated_summary": _fact_answer,
+                    "early_exit": True,
+                    "exit_reason": "metadata_fact_query",
+                    "step_timings": _step_timings,
+                    "trace": _trace,
+                }
+
+        # ── Early project detection (before LLM) ──────────────────────────────
+        # Name-match and metadata-match reduce LLM extraction to a simple lookup
+        # for queries like "Site C conditions" or "mines in northern BC".
+        _early_project_ids = None
+        if not project_ids and available_projects:
+            _name_id, _name_score = _AIH._match_project_by_query_text(query, available_projects, return_score=True)
+            if _name_id and _name_score >= 0.5:
+                # Any decent name match beats metadata: avoids metadata over-matching
+                # (e.g. "Site C dam" scoring 0.6 on name but matching water/wells projects on metadata)
+                _early_project_ids = [_name_id]
+                logger.info(f"🚀 AGENT EARLY DETECT: Name match '{_name_id}' (score={_name_score:.2f})")
+            else:
+                _meta_ids = _AIH._match_projects_by_metadata(query, available_projects)
+                if _meta_ids:
+                    _early_project_ids = _meta_ids
+                    logger.info(f"🚀 AGENT EARLY DETECT: Metadata match → {len(_meta_ids)} projects")
+                elif _name_id:
+                    _early_project_ids = [_name_id]
+                    logger.info(f"🚀 AGENT EARLY DETECT: Weak name match fallback '{_name_id}' (score={_name_score:.2f})")
+
         # Use parameter extractor to get optimized parameters
+        # available_strategies is intentionally not fetched — the frontend always supplies
+        # HYBRID_PARALLEL which takes precedence; the extractor has its own hardcoded fallback list.
         parameter_extractor = ParameterExtractorFactory.create_extractor()
-        
+
+        _t = time.time()
         extraction_result = parameter_extractor.extract_parameters(
             query=query,
             available_projects=available_projects,
             available_document_types=available_document_types,
-            available_strategies=available_strategies,
-            supplied_project_ids=project_ids,
+            available_strategies=None,
+            supplied_project_ids=project_ids or _early_project_ids,
             supplied_document_type_ids=document_type_ids,
             supplied_search_strategy=search_strategy,
-            user_location=user_location,            
+            user_location=user_location,
             supplied_project_status=project_status,
             supplied_years=years
         )
-        
+        _llm_extract_ms = round((time.time() - _t) * 1000, 2)
+        _step_timings["parameter_extraction_ms"] = round(
+            _llm_extract_ms + _proj_ms + _dt_ms, 2
+        )
+
         # Extract the optimized parameters
         optimized_project_ids = extraction_result.get('project_ids', [])
         optimized_document_type_ids = extraction_result.get('document_type_ids', [])
         optimized_search_strategy = extraction_result.get('search_strategy', 'HYBRID_PARALLEL')
         optimized_semantic_query = extraction_result.get('semantic_query', query)
-        optimized_location = extraction_result.get('location')  # Geographic search filter extracted from query
+        optimized_location = extraction_result.get('location')
         optimized_project_status = extraction_result.get('project_status')
         optimized_years = extraction_result.get('years', [])
+
+        _proj_detail = f"{optimized_project_ids}" if optimized_project_ids else "none (all projects)"
+        _dt_detail = f"{optimized_document_type_ids}" if optimized_document_type_ids else "none (all types)"
+        _q_detail = f'"{optimized_semantic_query}"' if optimized_semantic_query != query else "(same as original)"
+        _t_entry(
+            "extract_parameters(query, projects, doc_types, strategies)",
+            "ParameterExtractor (LLM call)",
+            _llm_extract_ms,
+            f"Projects: {_proj_detail} | Doc types: {_dt_detail} | Strategy: {optimized_search_strategy} | Rewritten query: {_q_detail}",
+        )
         
+        # Check for temporal decision-date patterns ("approved after 2010", "since 2018",
+        # "between 2015 and 2020", "last 3 years", etc.) and filter available_projects by
+        # their decisionDate field. This correctly handles project-approval temporal queries.
+        #
+        # Key design notes:
+        # • The vector search "years" param is just appended to the query text as semantic
+        #   context — it does NOT filter by document date. Large year lists corrupt the
+        #   embedding, causing bad or empty results. We clear optimized_years when we apply
+        #   the decision-date filter so the vector search isn't polluted.
+        # • We run the date filter even when the LLM identified project IDs, then intersect:
+        #   e.g. "mine projects approved after 2010" → LLM finds mine projects, date filter
+        #   keeps only those certified after 2010, intersection is what the user wants.
+        if available_projects:
+            date_filtered_ids = _filter_projects_by_decision_year(available_projects, query)
+            if date_filtered_ids:
+                if optimized_project_ids:
+                    # Intersect LLM's project selection with decision-date filtered projects
+                    date_set = set(date_filtered_ids)
+                    intersected = [p for p in optimized_project_ids if p in date_set]
+                    if intersected:
+                        optimized_project_ids = intersected
+                        logger.info(f"🗓️ STEP 2: Decision-date filter intersected with LLM projects → {len(optimized_project_ids)} projects")
+                    else:
+                        # No overlap — trust the date filter (it's more precise for temporal queries)
+                        optimized_project_ids = date_filtered_ids
+                        logger.info(f"🗓️ STEP 2: Decision-date filter overrode LLM (no intersection) → {len(optimized_project_ids)} projects")
+                else:
+                    optimized_project_ids = date_filtered_ids
+                    logger.info(f"🗓️ STEP 2: Decision-date filter applied → {len(optimized_project_ids)} projects scoped")
+                # Clear years so a big LLM-generated list doesn't corrupt the vector query
+                optimized_years = []
+                # Strip the temporal phrase from the semantic query so vector search focuses
+                # on document content, not the approval date string
+                cleaned_query = _strip_temporal_phrase(optimized_semantic_query)
+                if cleaned_query != optimized_semantic_query:
+                    logger.info(f"🗓️ STEP 2: Stripped temporal phrase from semantic query: '{optimized_semantic_query}' → '{cleaned_query}'")
+                    optimized_semantic_query = cleaned_query
+
+        # ── HyDE (Hypothetical Document Embeddings) ──────────────────────────
+        # WHAT IT DOES:
+        #   Instead of embedding the user's short query for vector search, we ask
+        #   the LLM to write a hypothetical EAO document passage that would answer
+        #   the query. That passage is richer and closer in style to real documents,
+        #   so pgvector finds better matches.
+        #
+        # HOW TO REVERT:
+        #   Set env var USE_HYDE=false  (or delete the setting entirely).
+        #   The code falls back to optimized_semantic_query unchanged — no other
+        #   lines need to be touched.
+        #
+        # TRADE-OFF: one extra LLM call (~0.5–1s). Monitor via the trace panel.
+        # ─────────────────────────────────────────────────────────────────────
+        if os.getenv("USE_HYDE", "false").lower() == "true":
+            _t_hyde = time.time()
+            try:
+                hyde_prompt = (
+                    f"You are an expert in BC environmental assessment documents.\n"
+                    f"Write a single paragraph (3-5 sentences) from an EAO environmental "
+                    f"assessment document that would directly answer this query:\n\n"
+                    f"\"{query}\"\n\n"
+                    f"Write only the passage — no preamble, no headings, no explanation. "
+                    f"Use technical EAO language: proponent, certificate, conditions, "
+                    f"assessment, impacts, mitigation measures, regulatory requirements."
+                )
+                hyde_messages = [
+                    {"role": "system", "content": "You generate hypothetical EAO document passages for semantic search."},
+                    {"role": "user",   "content": hyde_prompt},
+                ]
+                hyde_response = llm_client.chat_completion(
+                    messages=hyde_messages,
+                    temperature=0.3,
+                    max_tokens=200,
+                )
+                hyde_passage = (
+                    hyde_response.choices[0].message.content.strip()
+                    if hyde_response and hyde_response.choices
+                    else None
+                )
+                if hyde_passage:
+                    logger.info(f"🔮 HyDE: generated passage ({len(hyde_passage)} chars) replacing semantic query")
+                    optimized_semantic_query = hyde_passage
+                else:
+                    logger.warning("🔮 HyDE: empty response — keeping original semantic query")
+            except Exception as e:
+                logger.warning(f"🔮 HyDE: LLM call failed ({e}) — keeping original semantic query")
+            _hyde_ms = round((time.time() - _t_hyde) * 1000, 2)
+            _t_entry(
+                "generate_hyde_passage(query)",
+                "HyDE — LLM generates hypothetical document passage",
+                _hyde_ms,
+                f"Query expanded from {len(query)} → {len(optimized_semantic_query)} chars for richer vector match",
+            )
+        # ── end HyDE ─────────────────────────────────────────────────────────
+
         logger.info(f"🤖 STEP 2: Parameter extraction complete:")
         logger.info(f"  - Project IDs: {optimized_project_ids}")
         logger.info(f"  - Document Type IDs: {optimized_document_type_ids}")
@@ -2856,19 +3290,16 @@ def handle_agent_query(query: str, reason: str, llm_client=None, user_location: 
             max_parallel_workers=max_parallel_workers
         )
         
-        # Generate tool suggestions (for debugging/analysis)
-        logger.info("🤖 STEP 3: Generating tool suggestions...")
-        tool_suggestions = agent.generate_tool_suggestions(optimized_semantic_query)
-        logger.info(f"🤖 STEP 3: Generated {len(tool_suggestions)} tool suggestions")
-        
         # STEP 3: Execute Searches with Optimized Parameters
         logger.info("🤖 STEP 3: Executing searches with optimized parameters...")
-        
+
         # Use the optimized semantic query and parameters for searches
         search_results = []
-        
-        # Determine number of search variations (2-4 based on complexity)
-        num_searches = 3  # Default for agent mode
+        tool_suggestions = []
+
+        # One well-parameterised search is faster and cleaner than 3 noisy variations.
+        # Parameter extraction already produced optimal project_ids/doc_type_ids/strategy.
+        num_searches = 1
         
         # Execute multiple search variations with the optimized parameters
         search_queries = agent._generate_search_variations(optimized_semantic_query, num_searches)
@@ -2991,18 +3422,40 @@ def handle_agent_query(query: str, reason: str, llm_client=None, user_location: 
         execution_mode = "parallel" if agent.parallel_searches_enabled and len(search_queries) > 1 else "sequential"
         
         logger.info(f"🤖 STEP 3: Executing searches in {execution_mode} mode")
-        
+
         # Execute searches using appropriate strategy
+        _t = time.time()
         if parallel_searches_enabled and len(search_queries) > 1:
             search_results = execute_parallel_searches(search_queries, agent)
         else:
             search_results = execute_sequential_searches(search_queries, agent)
-        
-        logger.info(f"🤖 STEP 3: Completed {len(search_results)} successful searches")
-        
-        # STEP 4: Consolidate Results 
+        _step_timings["vector_search_ms"] = round((time.time() - _t) * 1000, 2)
+
+        _filter_parts = []
+        if optimized_project_ids:
+            _filter_parts.append(f"projects={optimized_project_ids}")
+        if optimized_document_type_ids:
+            _filter_parts.append(f"doc_types={optimized_document_type_ids}")
+        if optimized_location:
+            _filter_parts.append(f"location={optimized_location}")
+        if optimized_project_status:
+            _filter_parts.append(f"status={optimized_project_status}")
+        if optimized_years:
+            _filter_parts.append(f"years={optimized_years}")
+        _filter_str = ", ".join(_filter_parts) if _filter_parts else "none"
+        _t_entry(
+            f"VectorSearchClient.search(strategy={optimized_search_strategy})",
+            "VectorSearchClient → POST /vector-search → vector-api → PostgreSQL pgvector",
+            _step_timings["vector_search_ms"],
+            f'Query: "{optimized_semantic_query}" | Filters: {_filter_str} | Searches: {len(search_results)}',
+            is_external=True,
+        )
+
+        logger.info(f"🤖 STEP 3: Completed {len(search_results)} successful searches ({_step_timings['vector_search_ms']}ms)")
+
+        # STEP 4: Consolidate Results
         logger.info("🤖 STEP 4: Consolidating search results...")
-        
+        _t = time.time()
         all_documents = []
         all_document_chunks = []
         
@@ -3067,32 +3520,50 @@ def handle_agent_query(query: str, reason: str, llm_client=None, user_location: 
                     seen_chunk_content.add(content_hash)
 
         
-        logger.info(f"🤖 STEP 4: After deduplication: {len(unique_documents)} documents, {len(unique_chunks)} chunks")
-        
-        # STEP 5: Generate Summary
-        logger.info("🤖 STEP 5: Generating AI summary...")
-        
-        try:
-            summary_result = agent.execute_tool("summarize_results", {
-                "query": query,
-                "include_metadata": True
-            }, context={
-                "consolidated_results": {
-                    "documents": unique_documents,
-                    "document_chunks": unique_chunks
-                }
-            })
-            
-            if summary_result.get("success"):
-                final_summary = summary_result["result"]
-                logger.info("✅ Summary generation completed successfully")
-            else:
-                final_summary = "Summary generation failed"
-                logger.warning(f"❌ Summary generation failed: {summary_result.get('error')}")
-        except Exception as e:
-            logger.error(f"❌ Summary generation exception: {e}")
-            final_summary = "Summary generation encountered an error"
-        
+        _step_timings["consolidation_ms"] = round((time.time() - _t) * 1000, 2)
+        logger.info(f"🤖 STEP 4: After deduplication: {len(unique_documents)} documents, {len(unique_chunks)} chunks ({_step_timings['consolidation_ms']}ms)")
+        _t_entry(
+            "deduplicate_results(documents, chunks)",
+            "agent_stub (in-memory)",
+            _step_timings["consolidation_ms"],
+            f"Output: {len(unique_documents)} documents, {len(unique_chunks)} chunks after deduplication",
+        )
+
+        # STEP 5: Generate Summary (skip if DISABLE_SUMMARY=true)
+        _t = time.time()
+        if os.getenv("DISABLE_SUMMARY", "false").lower() == "true":
+            logger.info("🤖 STEP 5: Summary generation disabled via DISABLE_SUMMARY env var — skipping")
+            final_summary = ""
+        else:
+            logger.info("🤖 STEP 5: Generating AI summary...")
+            try:
+                summary_result = agent.execute_tool("summarize_results", {
+                    "query": query,
+                    "include_metadata": True
+                }, context={
+                    "consolidated_results": {
+                        "documents": unique_documents,
+                        "document_chunks": unique_chunks
+                    }
+                })
+
+                if summary_result.get("success"):
+                    final_summary = summary_result["result"]
+                    logger.info("✅ Summary generation completed successfully")
+                else:
+                    final_summary = "Summary generation failed"
+                    logger.warning(f"❌ Summary generation failed: {summary_result.get('error')}")
+            except Exception as e:
+                logger.error(f"❌ Summary generation exception: {e}")
+                final_summary = "Summary generation encountered an error"
+        _step_timings["summary_generation_ms"] = round((time.time() - _t) * 1000, 2)
+        _t_entry(
+            "execute_tool('summarize_results', {query, chunks})",
+            "SummarizerFactory (LLM call)",
+            _step_timings["summary_generation_ms"],
+            f"{'SKIPPED' if os.getenv('DISABLE_SUMMARY', 'false').lower() == 'true' else f'Summarised {len(unique_chunks)} chunks → natural-language response'}",
+        )
+
         # STEP 6: Return Results
         execution_time = round((time.time() - start_time) * 1000, 2)
         
@@ -3128,6 +3599,14 @@ def handle_agent_query(query: str, reason: str, llm_client=None, user_location: 
                 "execution_mode": execution_mode
             })
 
+        logger.info(
+            f"⏱️ AGENT STEPS | validate={_step_timings['relevance_check_ms']}ms | "
+            f"extract={_step_timings['parameter_extraction_ms']}ms | "
+            f"search={_step_timings['vector_search_ms']}ms | "
+            f"consolidate={_step_timings['consolidation_ms']}ms | "
+            f"summary={_step_timings['summary_generation_ms']}ms"
+        )
+
         return {
             "agent_results": search_results,
             "planning_method": "Simplified parameter extraction + multi-search",
@@ -3137,8 +3616,10 @@ def handle_agent_query(query: str, reason: str, llm_client=None, user_location: 
             "documents": unique_documents,
             "document_chunks": unique_chunks,
             "search_executions": len(search_results),
-            "search_execution_details": search_execution_details,  # NEW: Detailed execution visibility
+            "search_execution_details": search_execution_details,
             "tool_suggestions": tool_suggestions,
+            "step_timings": _step_timings,
+            "trace": _trace,
             "extracted_parameters": {
                 "project_ids": optimized_project_ids,
                 "document_type_ids": optimized_document_type_ids,
